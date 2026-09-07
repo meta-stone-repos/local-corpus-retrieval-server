@@ -45,7 +45,11 @@ def main():
             "--snippet-max-tokens",
             type=int,
             default=512,
-            help="Number of tokens to include for each document snippet in search results using Qwen/Qwen3-0.6B tokenizer (default: 512). Set to -1 to disable.",
+            help="Number of tokens to include for each document snippet in search results (default: 512). Set to -1 to disable.",
+        )
+        parser.add_argument(
+            "--snippet-tokenizer",
+            help="Tokenizer name or local path for snippet truncation. In corpus mode, defaults to the dense model recorded in the manifest.",
         )
         parser.add_argument(
             "--k",
@@ -158,6 +162,7 @@ def main():
             dense_max_batch_size=args.dense_max_batch_size,
             dense_max_wait_ms=args.dense_max_wait_ms,
             dense_max_queue_size=args.dense_max_queue_size,
+            snippet_tokenizer=args.snippet_tokenizer,
         )
 
         tools_registered = ["search"]
