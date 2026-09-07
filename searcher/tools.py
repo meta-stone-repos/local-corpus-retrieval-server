@@ -17,10 +17,13 @@ def register_tools(
     dense_max_batch_size: int = 16,
     dense_max_wait_ms: float = 5.0,
     dense_max_queue_size: int = 64,
+    snippet_tokenizer: str | None = None,
 ):
     tokenizer = None
     if snippet_max_tokens and snippet_max_tokens > 0:
-        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+        tokenizer = AutoTokenizer.from_pretrained(
+            snippet_tokenizer or "Qwen/Qwen3-0.6B"
+        )
 
     # BM25 uses multiple CPU workers.
     # Dense keeps exactly one backend worker; concurrency is achieved

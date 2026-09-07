@@ -63,3 +63,5 @@ core.*
 *.bak
 *.orig
 *~
+
+/indexes
