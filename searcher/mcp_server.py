@@ -9,9 +9,12 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
+from mcp_sse_compat import install_legacy_sse_cleanup_patch
+
 from dotenv import load_dotenv
 from searchers import SearcherType
 from tools import register_tools
+from corpus_config import apply_corpus_manifest
 
 load_dotenv(override=False)
 
@@ -31,6 +34,11 @@ def main():
             required=True,
             help=f"Type of searcher to use: {', '.join(SearcherType.get_choices())}",
         )
+        parser.add_argument(
+            "--corpus",
+            type=str,
+            help="Name of a locally built corpus under corpora/<name>. When set, index/model settings are loaded from its manifest.json.",
+        )
 
         # MCP server and high-level arguments
         parser.add_argument(
@@ -44,6 +52,30 @@ def main():
             type=int,
             default=5,
             help="Fixed number of search results to return for all queries in this session (default: 5).",
+        )
+        parser.add_argument(
+            "--bm25-workers",
+            type=int,
+            default=1,
+            help="Number of concurrent BM25 search workers (default: 1). Ignored for non-BM25 searchers.",
+        )
+        parser.add_argument(
+            "--dense-max-batch-size",
+            type=int,
+            default=16,
+            help="Maximum number of Dense search requests combined into one GPU batch (default: 16).",
+        )
+        parser.add_argument(
+            "--dense-max-wait-ms",
+            type=float,
+            default=5.0,
+            help="Maximum time the oldest Dense request waits for more requests to join its batch (default: 5 ms).",
+        )
+        parser.add_argument(
+            "--dense-max-queue-size",
+            type=int,
+            default=64,
+            help="Maximum number of Dense requests waiting in the batching queue (default: 64).",
         )
         parser.add_argument(
             "--get-document",
@@ -86,6 +118,8 @@ def main():
 
         args = parser.parse_args()
 
+        args = apply_corpus_manifest(args)
+
         if args.hf_token:
             print(
                 f"[DEBUG] Setting HF token from CLI argument: {args.hf_token[:10]}..."
@@ -106,13 +140,29 @@ def main():
         port = args.port
         public = args.public
 
+        if transport == "sse":
+            patched = install_legacy_sse_cleanup_patch()
+            if patched:
+                print("[MCP] Installed legacy SSE session cleanup backport")
+
         mcp = FastMCP(name="search-server")
 
-        register_tools(mcp, searcher, snippet_max_tokens, k, include_get_document)
+        # register_tools(mcp, searcher, snippet_max_tokens, k, include_get_document)
+        register_tools(
+            mcp,
+            searcher,
+            snippet_max_tokens,
+            k,
+            include_get_document,
+            bm25_workers=args.bm25_workers,
+            dense_max_batch_size=args.dense_max_batch_size,
+            dense_max_wait_ms=args.dense_max_wait_ms,
+            dense_max_queue_size=args.dense_max_queue_size,
+        )
 
         tools_registered = ["search"]
         if include_get_document:
-            tools_registered.append("get_document")
+            tools_registered.append("read_document")
         tools_str = ", ".join(tools_registered)
 
         print(
@@ -149,7 +199,8 @@ def main():
         if transport == "stdio":
             mcp.run(transport="stdio")
         else:
-            mcp.run(transport=transport, path="/mcp", port=port)
+            # mcp.run(transport=transport, path="/mcp", port=port)
+            mcp.run(transport=transport, host="0.0.0.0", path="/mcp", port=port,)
 
     except Exception as e:
         print("Error", e)

@@ -1,7 +1,7 @@
 [project]
-name = "browsecomp-plus"
+name = "local-corpus-retrieval-server"
 version = "0.1.0"
-description = "Add your description here"
+description = "Self-hosted BM25 and dense retrieval server for independent local corpora"
 requires-python = ">=3.10"
 dependencies = [
     "accelerate>=1.9.0",

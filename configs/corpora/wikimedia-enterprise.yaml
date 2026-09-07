@@ -1,0 +1,64 @@
+config_version: 1
+
+corpus:
+  name: wikimedia-enterprise
+
+source:
+  type: web
+  url: https://dumps.wikimedia.org/other/enterprise_html/runs/20250320/
+  path: null
+  recursive: true
+  archive_pattern: "*-ENTERPRISE-HTML.json.tar.gz"
+  include_files: []
+  exclude_files: []
+  download_dir: data/wikimedia-enterprise/downloads
+  keep_downloads: true
+  user_agent: "LocalCorpusRetrievalServer/1.0 (contact: replace-with-real-email)"
+
+cleaning:
+  min_chars: 1
+  batch_size: 1000
+  progress_every: 10000
+  on_error: fail
+
+build:
+  # BM25 is enabled by default to avoid accidentally starting a large GPU job.
+  # Add dense after validating the cleaned corpus.
+  # Add ann only when dense.index_type is changed to ivf-flat.
+  targets:
+    - bm25
+    # - dense
+    # - ann
+
+  bm25:
+    threads: 16
+
+  dense:
+    model: Qwen/Qwen3-Embedding-0.6B
+    pooling: eos
+    passage_max_len: 4096
+    query_max_len: 8192
+    batch_size: 32
+    normalize: true
+    dtype: fp16
+    gpus: "0"
+    shards: 1
+    index_type: flat
+    query_prefix: "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
+
+  ann:
+    nlist: 0
+    nprobe: 32
+    train_size: 0
+    seed: 42
+    threads: 0
+    niter: 25
+    backend: cpu
+    gpu_batch_size: 8192
+    gpu_dtype: float32
+
+runtime:
+  dry_run: false
+  resume: true
+  overwrite: false
+  keep_build_files: false

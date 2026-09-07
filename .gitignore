@@ -1,12 +1,65 @@
+# Credentials and machine-local configuration
 .env
+.env.*
+!.env.example
+search_env.sh
+
+# Python environments and caches
+.venv/
+.venv-*/
+.venv-*
 __pycache__/
-.venv
-.vscode
-collection/
-indexes/
-tmp/
-retrieval/
-data/browsecomp_plus_decrypted.jsonl
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# IDE and operating-system files
+.vscode/
+.idea/
+.DS_Store
+
+# Corpora, indexes and downloaded data
+/corpora/
+/indexes/
+data/*
+!data/.gitkeep
+/collection/
+/retrieval/
+
+# Runtime outputs
+/logs/
+/outputs/
+/runs/
+/evals/
+/tmp/
+/hf_cache/
+/models/
+/wheels/
+/backups/
+
+# Generated retrieval artifacts
+*.faiss
+*.pkl
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.jsonl
+*.jsonl.gz
+*.tsv.gz
+*.tar.gz
+*.tgz
+*.whl
+
+# Generated benchmark files
 topics-qrels/queries.tsv
-runs/
-evals/
+
+# Logs, crashes and temporary backups
+*.log
+hs_err_pid*.log
+core
+core.*
+*.bak
+*.orig
+*~
