@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 PROJECT_DIR="/home/xww/workspace/local-corpus-retrieval-server"
 INDEX_DIR="/home/xww/workspace/data/local-corpus-retrieval-server/indexes"
-CONFIG="$PROJECT_DIR/configs/corpora/xww-local.yaml"
+CONFIG="$PROJECT_DIR/configs/corpora/xww-enwikibooks.yaml"
 export CUDA_VISIBLE_DEVICES=6
 
 cd "$PROJECT_DIR"

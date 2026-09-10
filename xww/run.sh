@@ -2,10 +2,11 @@
 set -Eeuo pipefail
 
 PROJECT_DIR="/home/xww/workspace/local-corpus-retrieval-server"
-CORPUS_NAME="xww-local"
+# CORPUS_NAME="xww-local"
+CORPUS_NAME="xww-enwikibooks"
 BM25_PORT="8090"
 DENSE_PORT="8091"
-GPU_ID="6"
+GPU_ID="7"
 
 cd "$PROJECT_DIR"
 source .venv/bin/activate
