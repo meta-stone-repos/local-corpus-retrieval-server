@@ -1,0 +1,42 @@
+config_version: 1
+
+corpus:
+  name: xww-local
+
+source:
+  type: local
+  # 修改为 Wikimedia Enterprise *.json.tar.gz 文件所在目录。
+  path: /home/xww/workspace/data/deep_research/raw/simplewikiquote
+  recursive: true
+  archive_pattern: "*-ENTERPRISE-HTML.json.tar.gz"
+  include_files: []
+  exclude_files: []
+
+cleaning:
+  min_chars: 1
+  batch_size: 1000
+  progress_every: 10000
+  on_error: fail
+
+build:
+  targets: [bm25, dense]
+  bm25:
+    threads: 16
+
+  dense:
+    model: /home/xww/workspace/data/models/Qwen3-Embedding-0.6B
+    pooling: eos
+    passage_max_len: 4096
+    query_max_len: 8192
+    batch_size: 32
+    normalize: true
+    dtype: fp16
+    gpus: "6"
+    shards: 1
+    index_type: flat
+
+runtime:
+  dry_run: false
+  resume: true
+  overwrite: false
+  keep_build_files: false

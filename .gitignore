@@ -68,3 +68,4 @@ core.*
 /configs/*.local.yaml
 /configs/*.local.yaml.bak-*
 /configs/online_zhipu.json
+/indexes
