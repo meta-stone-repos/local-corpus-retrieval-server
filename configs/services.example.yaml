@@ -1,0 +1,102 @@
+# Copy to services.local.yaml and configure credentials locally.
+# Adjust index paths, HF cache location, and GPU IDs for your deployment.
+# runtime.env is intentionally omitted to avoid copying credentials.
+
+version: 1
+defaults:
+  runtime:
+    hf_home: /workspace/hf_cache
+    hf_offline: true
+  args:
+    transport: sse
+    k: 5
+    snippet_max_chars: 2048
+services:
+  bm25:
+    backend: bm25
+    args:
+      port: 8080
+      index_path: indexes/bm25
+      document_store: corpora/browsecomp/documents.sqlite
+      get_document: true
+      bm25_workers: 16
+  dense:
+    backend: faiss
+    runtime:
+      cuda_visible_devices: '6'
+    args:
+      port: 8082
+      index_type: flat
+      index_path: indexes/qwen3-embedding-0.6b/corpus.shard*.pkl
+      document_store: corpora/browsecomp/documents.sqlite
+      model_name: Qwen/Qwen3-Embedding-0.6B
+      pooling: eos
+      normalize: true
+      torch_dtype: float16
+      max_length: 8192
+      task_prefix: 'Instruct: Given a web search query, retrieve relevant passages
+        that answer the query
+
+        Query:'
+      get_document: true
+      dense_max_batch_size: 16
+      dense_max_wait_ms: 1
+      dense_max_queue_size: 64
+  online:
+    backend: online
+    provider:
+      name: zhipu
+      api_key_env: ZHIPU_API_KEY
+      base_url: https://open.bigmodel.cn/api/paas/v4/
+      timeout_seconds: 60
+      search:
+        search_engine: search_std
+        search_intent: false
+        count: 10
+        search_recency_filter: oneMonth
+        content_size: medium
+      read:
+        no_cache: true
+        return_format: text
+        retain_images: false
+        with_images_summary: false
+        with_links_summary: false
+      api_key: ''
+    args:
+      port: 8081
+      content_cache_idle_ttl_seconds: 1800
+      content_cache_max_mib: 256
+      mapping_idle_ttl_seconds: 86400
+      mapping_max_entries: 100000
+      cache_cleanup_interval_seconds: 60
+  iqs:
+    runtime:
+      hf_home: /workspace/hf_cache
+      hf_offline: true
+    args:
+      transport: sse
+      k: 5
+      port: 8083
+      content_cache_idle_ttl_seconds: 1800
+      content_cache_max_mib: 256
+      mapping_idle_ttl_seconds: 86400
+      mapping_max_entries: 100000
+      cache_cleanup_interval_seconds: 60
+      snippet_max_chars: 2048
+    backend: online
+    provider:
+      name: iqs
+      api_key: ''
+      api_key_env: IQS_API_KEY
+      base_url: https://cloud-iqs.aliyuncs.com/
+      timeout_seconds: 60
+      search:
+        engineType: LiteAdvanced
+        timeRange: NoLimit
+        advancedParams:
+          numResults: 10
+      read:
+        pageTimeout: 10000
+        maxAge: 0
+        readability:
+          readabilityMode: normal

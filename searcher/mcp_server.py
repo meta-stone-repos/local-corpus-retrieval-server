@@ -42,20 +42,16 @@ def main():
 
         # MCP server and high-level arguments
         parser.add_argument(
-            "--snippet-max-tokens",
+            "--snippet-max-chars",
             type=int,
-            default=512,
-            help="Number of tokens to include for each document snippet in search results (default: 512). Set to -1 to disable.",
-        )
-        parser.add_argument(
-            "--snippet-tokenizer",
-            help="Tokenizer name or local path for snippet truncation. In corpus mode, defaults to the dense model recorded in the manifest.",
+            default=2048,
+            help="Maximum Unicode characters per snippet; -1 disables truncation.",
         )
         parser.add_argument(
             "--k",
             type=int,
             default=5,
-            help="Fixed number of search results to return for all queries in this session (default: 5).",
+            help="Default search k when the Agent omits it (default: 5).",
         )
         parser.add_argument(
             "--bm25-workers",
@@ -121,6 +117,10 @@ def main():
         searcher_class.parse_args(parser)
 
         args = parser.parse_args()
+        if args.k <= 0:
+            parser.error("--k must be positive")
+        if args.snippet_max_chars != -1 and args.snippet_max_chars <= 0:
+            parser.error("--snippet-max-chars must be positive or -1")
 
         args = apply_corpus_manifest(args)
 
@@ -137,7 +137,7 @@ def main():
 
         searcher = searcher_class(args)
 
-        snippet_max_tokens = args.snippet_max_tokens
+        snippet_max_chars = args.snippet_max_chars
         k = args.k
         include_get_document = args.get_document
         transport = args.transport
@@ -151,18 +151,17 @@ def main():
 
         mcp = FastMCP(name="search-server")
 
-        # register_tools(mcp, searcher, snippet_max_tokens, k, include_get_document)
+        # register_tools(mcp, searcher, snippet_max_chars, k, include_get_document)
         register_tools(
             mcp,
             searcher,
-            snippet_max_tokens,
+            snippet_max_chars,
             k,
             include_get_document,
             bm25_workers=args.bm25_workers,
             dense_max_batch_size=args.dense_max_batch_size,
             dense_max_wait_ms=args.dense_max_wait_ms,
             dense_max_queue_size=args.dense_max_queue_size,
-            snippet_tokenizer=args.snippet_tokenizer,
         )
 
         tools_registered = ["search"]
@@ -171,7 +170,7 @@ def main():
         tools_str = ", ".join(tools_registered)
 
         print(
-            f"MCP server started with {searcher.search_type} search (snippet_max_tokens={snippet_max_tokens}, k={k}) using transport {transport.upper()}"
+            f"MCP server started with {searcher.search_type} search (snippet_max_chars={snippet_max_chars}, k={k}) using transport {transport.upper()}"
         )
         print(f"Registered tools: {tools_str}")
 

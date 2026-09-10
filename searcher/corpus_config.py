@@ -62,10 +62,6 @@ def apply_corpus_manifest(args):
             f"Corpus '{args.corpus}' does not have a built '{args.searcher_type}' retriever."
         )
 
-    if not getattr(args, "snippet_tokenizer", None):
-        dense_config = retrievers.get("faiss", {})
-        args.snippet_tokenizer = dense_config.get("model_name")
-
     if "index_path" in config:
         args.index_path = _resolve_project_path(config["index_path"])
 

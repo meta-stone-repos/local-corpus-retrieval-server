@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-This project is a self-hosted search engine for fixed local corpora. It packages sparse retrieval, dense retrieval, document reading, corpus ingestion, index construction, and MCP serving into one deployable system. Its main purpose is to let agents and applications search private, curated, or reproducible datasets without depending on a live web search engine.
+This project is a self-hosted retrieval server for both fixed local corpora and live web APIs. It combines BM25, Dense Flat/IVF-Flat, document reading, corpus ingestion, index construction, and MCP serving. Local retrieval supports private, curated, and reproducible datasets without a web search dependency; optional Zhipu and Alibaba Cloud IQS adapters provide live search and lazy webpage reading through the same Tool contract.
 
 The server was developed from the retrieval code in [BrowseComp-Plus](https://texttron.github.io/BrowseComp-Plus/), but it is a separate engineering project rather than the BrowseComp-Plus benchmark itself. BrowseComp-Plus datasets, indexes, and evaluation tools remain supported as an optional integration and reproducibility workload.
 
@@ -15,7 +15,9 @@ The local retrieval server provides:
 - large-scale approximate retrieval through FAISS IVF-Flat;
 - independent, manifest-backed local corpora;
 - a SQLite document store for bounded full-document reading;
-- MCP servers exposing the same tools for BM25 and dense backends;
+- uniform `search` / `read_document` tools for offline and online retrieval;
+- Zhipu and IQS adapters with stable URL IDs, lazy reading, and bounded transient caches;
+- unified YAML service selection, readiness reporting, logs, and group stop/status;
 - resumable corpus normalization and index construction;
 - a YAML pipeline for Wikimedia Enterprise HTML archives.
 
@@ -26,6 +28,10 @@ The local retrieval server provides:
 - [Environment setup](#environment-setup)
 - [Dataset and pre-built indexes](#dataset-and-pre-built-indexes)
 - [Running retrieval servers](#running-retrieval-servers)
+- [Tool output contract](#tool-output-contract)
+- [Online APIs and cache](#online-apis-and-cache)
+- [Adding a Provider](#adding-a-provider)
+- [Acceptance tests](#acceptance-tests)
 - [Building a local corpus](#building-a-local-corpus)
 - [Wikimedia Enterprise YAML pipeline](#wikimedia-enterprise-yaml-pipeline)
 - [Build artifacts and disk usage](#build-artifacts-and-disk-usage)
@@ -42,6 +48,9 @@ The local retrieval server provides:
 | Dense ANN retrieval | FAISS IVF-Flat | Large corpora where exact search is too expensive |
 | Document store | Read-only SQLite | Full text, URL, title, language, and character-count lookup |
 | Corpus manifest | `corpora/<name>/manifest.json` | Keeps build-time and query-time settings consistent |
+| Online retrieval | Zhipu / Alibaba Cloud IQS | Live search and same-vendor webpage reading |
+| Online cache | Process-local mapping and body LRU/idle TTL | Cross-connection reads without repeated fetching |
+| Service launcher | `searcher/serve.py` + YAML | Select services, check readiness, inspect/stop a group |
 | MCP interface | FastMCP | Uniform `search` and `read_document` tools |
 
 Each local corpus is independent. Its normalized documents, document store, sparse index, dense index, and manifest are never merged with another corpus.
@@ -82,66 +91,20 @@ python scripts_preprocess/materialize_browsecomp_corpus.py \
 
 Use `--overwrite` only when intentionally replacing an existing `corpora/browsecomp` directory.
 
-### 4. Start BM25
+### 4. Configure and start MCP services
+
+Create a local YAML using the [unified example](#unified-yaml-example). For an existing deployment, keep your current YAML and credentials. The example uses BrowseComp-Plus indexes, Dense GPU 6, and a pre-populated `/workspace/hf_cache`; adjust these to your machine.
 
 ```bash
-BM25_PORT=8080
-
-python searcher/mcp_server.py \
-  --searcher-type bm25 \
-  --index-path indexes/bm25 \
-  --document-store corpora/browsecomp/documents.sqlite \
-  --get-document \
-  --bm25-workers 16 \
-  --snippet-max-tokens 512 \
-  --transport sse \
-  --port "$BM25_PORT"
+python3 searcher/serve.py --config configs/services.local.yaml --services bm25 dense --check
+python3 searcher/serve.py --config configs/services.local.yaml --services bm25 dense
 ```
 
-### 5. Start dense retrieval
+Wait for both `READY` messages. BM25 uses `http://127.0.0.1:8080/mcp`; Dense uses `http://127.0.0.1:8082/mcp`. Do not start the same configuration a second time in another terminal. Use `--status` or `--stop` there instead.
 
-Run this in another shell:
+To use online search without building local indexes, configure Zhipu/IQS credentials and start `--services online`, `--services iqs`, or `--services online iqs`. Online services do not require a local corpus or a snippet tokenizer; snippets are sliced by Unicode characters. See [online settings](#online-apis-and-cache) and [acceptance tests](#acceptance-tests).
 
-```bash
-source .venv/bin/activate
-
-GPU_ID=0
-DENSE_PORT=8081
-
-CUDA_VISIBLE_DEVICES="$GPU_ID" \
-python searcher/mcp_server.py \
-  --searcher-type faiss \
-  --index-path "indexes/qwen3-embedding-0.6b/corpus.shard*.pkl" \
-  --model-name Qwen/Qwen3-Embedding-0.6B \
-  --pooling eos \
-  --normalize \
-  --document-store corpora/browsecomp/documents.sqlite \
-  --get-document \
-  --dense-max-batch-size 16 \
-  --dense-max-wait-ms 1 \
-  --dense-max-queue-size 64 \
-  --snippet-max-tokens 512 \
-  --transport sse \
-  --port "$DENSE_PORT"
-```
-
-The local MCP endpoints are:
-
-```text
-BM25:  http://127.0.0.1:8080/mcp
-Dense: http://127.0.0.1:8081/mcp
-```
-
-Replace `127.0.0.1` with the server hostname only when the client runs on another machine and network access has been configured safely.
-
-Both servers expose the same tools:
-
-```text
-search(query)
-read_document(docid, chunk_index=0)
-```
-
-`--get-document` is a legacy CLI flag name. The tool registered for clients is `read_document`, which returns one bounded 8,192-character chunk at a time.
+Both offline and online services expose `search(query, k=5)` and `read_document(docid, chunk_index=0)` with the [same successful-result schema](#tool-output-contract). Offline services need `get_document: true` to enable reading. Each read returns at most 8192 Unicode characters.
 
 ## Environment setup
 
@@ -277,7 +240,6 @@ Use a persistent location outside `.venv`:
 export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"
-export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
 
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 export PATH="$CUDA_HOME/bin:$PATH"
@@ -390,163 +352,680 @@ The script downloads the available BM25 and Qwen3-Embedding indexes from `Tevatr
 
 ## Running retrieval servers
 
-There are two configuration modes.
+Use `searcher/serve.py` and one YAML file to launch BM25, Dense Flat/IVF-Flat, Zhipu, and IQS. Configure first, then select services by name; changes take effect after restart, not through hot reload. Commands below run from the repository root inside the runtime environment (inside Docker when using Docker).
 
-### Manifest mode: recommended for locally built corpora
+### Unified YAML example
 
-Every corpus built with `build_corpus.py` has a manifest under `corpora/<name>/manifest.json`. The manifest records the index path, model, pooling mode, normalization, query prefix, document store, index type, and ANN settings.
-
-Start BM25:
+For a fresh checkout, create the local configuration from the credential-free template:
 
 ```bash
-CORPUS_NAME=my-corpus
-PORT=8080
-
-python searcher/mcp_server.py \
-  --searcher-type bm25 \
-  --corpus "$CORPUS_NAME" \
-  --get-document \
-  --bm25-workers 16 \
-  --transport sse \
-  --port "$PORT"
+cp -n configs/services.example.yaml configs/services.local.yaml
+chmod 600 configs/services.local.yaml
 ```
 
-Start dense retrieval:
+`cp -n` preserves an existing local configuration. Configure credentials locally and adjust paths/GPU IDs. Local configuration files and their backups are ignored; commit only the sanitized example.
+
+
+Save the following as `configs/services.local.yaml` for a **new deployment**. Do not overwrite an existing local configuration: it may contain credentials and tuned paths. This is a deployment example, not a claim that this file is shipped with every checkout. Adjust the cache/index paths and GPU ID to your machine. The Dense example uses GPU **6**, BrowseComp-Plus Flat shards, and the local SQLite document store.
+
+```yaml
+version: 1
+
+defaults:
+  runtime:
+    hf_home: /workspace/hf_cache
+    hf_offline: true
+  args:
+    transport: sse
+    k: 5
+    snippet_max_chars: 2048
+
+services:
+  bm25:
+    backend: bm25
+    args:
+      port: 8080
+      index_path: indexes/bm25
+      document_store: corpora/browsecomp/documents.sqlite
+      get_document: true
+      bm25_workers: 16
+
+  dense:
+    backend: faiss
+    runtime:
+      cuda_visible_devices: "6"
+    args:
+      port: 8082
+      index_type: flat
+      index_path: "indexes/qwen3-embedding-0.6b/corpus.shard*.pkl"
+      model_name: Qwen/Qwen3-Embedding-0.6B
+      pooling: eos
+      normalize: true
+      torch_dtype: float16
+      document_store: corpora/browsecomp/documents.sqlite
+      get_document: true
+      dense_max_batch_size: 16
+      dense_max_wait_ms: 1
+      dense_max_queue_size: 64
+
+  online:
+    backend: online
+    args:
+      host: 127.0.0.1
+      port: 8081
+      content_cache_idle_ttl_seconds: 1800
+      content_cache_max_mib: 256
+      mapping_idle_ttl_seconds: 86400
+      mapping_max_entries: 100000
+      cache_cleanup_interval_seconds: 60
+    provider:
+      name: zhipu
+      api_key: ""
+      api_key_env: ZHIPU_API_KEY
+      base_url: https://open.bigmodel.cn/api/paas/v4/
+      timeout_seconds: 60
+      search:
+        search_engine: search_std
+        search_intent: false
+        count: 10  # Fallback for direct Provider calls; MCP passes per-call k.
+        search_recency_filter: noLimit
+        content_size: medium
+      read:
+        no_cache: true
+        return_format: text
+        retain_images: false
+        with_images_summary: false
+        with_links_summary: false
+
+  iqs:
+    backend: online
+    args:
+      host: 127.0.0.1
+      port: 8083
+      content_cache_idle_ttl_seconds: 1800
+      content_cache_max_mib: 256
+      mapping_idle_ttl_seconds: 86400
+      mapping_max_entries: 100000
+      cache_cleanup_interval_seconds: 60
+    provider:
+      name: iqs
+      api_key: ""
+      api_key_env: IQS_API_KEY
+      base_url: https://cloud-iqs.aliyuncs.com/
+      timeout_seconds: 60
+      search:
+        engineType: LiteAdvanced
+        timeRange: NoLimit
+        advancedParams:
+          numResults: 10  # Fallback for direct Provider calls; MCP passes per-call k.
+      read:
+        pageTimeout: 10000
+        maxAge: 0
+        readability:
+          readabilityMode: normal
+```
+
+The online entries use loopback binding for local tests. The current offline HTTP entry point binds `0.0.0.0` and does not accept `args.host`; restrict Docker port publishing/firewall access as appropriate. These examples do not add authentication or TLS. Do not expose the services directly to untrusted networks.
+
+### Start, inspect, and stop
 
 ```bash
-CORPUS_NAME=my-corpus
-GPU_ID=0
-PORT=8081
+# Validate configuration structure and local paths; no model loading/API calls.
+python3 searcher/serve.py --config configs/services.local.yaml --all --check
 
-CUDA_VISIBLE_DEVICES="$GPU_ID" \
-python searcher/mcp_server.py \
-  --searcher-type faiss \
-  --corpus "$CORPUS_NAME" \
-  --get-document \
-  --dense-max-batch-size 16 \
-  --dense-max-wait-ms 1 \
-  --dense-max-queue-size 64 \
-  --transport sse \
-  --port "$PORT"
+# Choose ONE launch command for this configuration.
+python3 searcher/serve.py --config configs/services.local.yaml --services bm25 dense
+# Or: --services online iqs
+# Or: --services bm25 iqs
+# Or: --all
 ```
 
-Do not repeat model or index settings on the command line unless intentionally overriding a manifest-supported server option. Query-time embedding settings must match the document index.
+`--all` includes every service in the file, so both online API credentials must be available if both online entries are present. `--services` takes space-separated names, not a comma-separated string. Example endpoints:
 
-### Explicit-path mode: legacy indexes and advanced use
-
-BM25 template:
+To launch all four configured services instead of a subset:
 
 ```bash
-BM25_INDEX_DIR=indexes/bm25
-DOCUMENT_STORE=corpora/browsecomp/documents.sqlite
-PORT=8080
-
-python searcher/mcp_server.py \
-  --searcher-type bm25 \
-  --index-path "$BM25_INDEX_DIR" \
-  --document-store "$DOCUMENT_STORE" \
-  --get-document \
-  --bm25-workers 16 \
-  --transport sse \
-  --port "$PORT"
+python3 searcher/serve.py --config configs/services.local.yaml --all
 ```
 
-Dense Flat template:
+| Service name | Backend/provider | Endpoint |
+| --- | --- | --- |
+| `bm25` | BM25 | `http://127.0.0.1:8080/mcp` |
+| `dense` | FAISS | `http://127.0.0.1:8082/mcp` |
+| `online` | Zhipu | `http://127.0.0.1:8081/mcp` |
+| `iqs` | IQS | `http://127.0.0.1:8083/mcp` |
+
+The launcher stays in the foreground and prints `CHECK`, `STARTING`, `WAITING`, and `READY`. `READY` means an MCP connection succeeded and the expected tools were listed; it does **not** validate API credentials, upstream search/read behavior, retrieval quality, or throughput. `--startup-timeout 900` is the default startup deadline in seconds. A child exit or startup failure stops the other children in that launch group; there is no automatic restart policy.
+
+In another terminal, using the **same runtime/container and configuration path**:
 
 ```bash
-MODEL_NAME=Qwen/Qwen3-Embedding-0.6B
-POOLING=eos
-DENSE_INDEX_GLOB='indexes/qwen3-embedding-0.6b/corpus.shard*.pkl'
-DOCUMENT_STORE=corpora/browsecomp/documents.sqlite
-GPU_ID=0
-PORT=8081
-
-CUDA_VISIBLE_DEVICES="$GPU_ID" \
-python searcher/mcp_server.py \
-  --searcher-type faiss \
-  --index-type flat \
-  --index-path "$DENSE_INDEX_GLOB" \
-  --model-name "$MODEL_NAME" \
-  --pooling "$POOLING" \
-  --normalize \
-  --document-store "$DOCUMENT_STORE" \
-  --get-document \
-  --dense-max-batch-size 16 \
-  --dense-max-wait-ms 1 \
-  --dense-max-queue-size 64 \
-  --transport sse \
-  --port "$PORT"
+python3 searcher/serve.py --config configs/services.local.yaml --status
+python3 searcher/serve.py --config configs/services.local.yaml --stop
 ```
 
-IVF-Flat template:
+`--status` reports tracked process/state information, not a new end-to-end API health test. `--stop` stops the whole tracked group, not one selected service; do not combine it with `--services`, `--all`, or `--check`. `Ctrl+C` also stops the foreground group. Groups are identified by the resolved configuration path, with one launcher per configuration. To change the selected services, stop that group and start the new selection. To manage groups independently, use separate configuration files with non-conflicting ports. A service previously started from `services.iqs.local.yaml` must be stopped using that old path before launching IQS from the unified file; editing/merging YAML does not transfer process ownership.
+
+Logs are written to `logs/services/<run-id>/<service>.log`; the launcher prints exact paths. Process state/locks are under `logs/services/.state/`. Group management relies on Linux `/proc`, process groups, file locks, and PID identity checks. The launcher is not a daemon/service manager and does not promise survival after terminal closure or automatically adopt orphan processes.
+
+### YAML fields and inheritance
+
+| Field | Meaning |
+| --- | --- |
+| `version` | Required; currently `1` |
+| `defaults.runtime`, `defaults.args` | Shared settings; keep only fields accepted by all inheriting services |
+| `services.<name>.backend` | `bm25`, `faiss`, or `online`; Dense ANN still uses `faiss` |
+| `services.<name>.runtime` | Environment configuration for that child process |
+| `services.<name>.args` | Worker CLI arguments, using underscore names: `snippet_max_chars` → `--snippet-max-chars` |
+| `services.<name>.provider` | Online only; `name` selects a registered adapter; other fields configure that adapter |
+
+Service mappings recursively override defaults. Lists/scalars replace inherited values; absent fields continue to inherit. Duplicate YAML keys and unknown top-level/service/runtime fields are rejected. `args` accepts scalar values only: `true` emits a flag, `false`/`null` omits it, other values emit `--name=value`. Omitting a flag does not negate a backend's own default or a manifest setting. Nested provider options belong under `provider`, not `args`.
+
+`--config` itself is resolved from the current working directory. Workers run from the repository root; relative index, corpus, and cache paths in this example are rooted there, not at the YAML directory. YAML does **not** expand `$VARIABLE` or `${VARIABLE}` strings. Use `api_key_env` or actual paths instead.
+
+| `runtime` field | Behavior |
+| --- | --- |
+| `hf_home` | Sets `HF_HOME`, `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, and `HF_DATASETS_CACHE`; removes inherited `TRANSFORMERS_CACHE` |
+| `hf_offline` | Sets `HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE` to `1`/`0` |
+| `cuda_visible_devices` | Sets `CUDA_VISIBLE_DEVICES`; quote GPU lists, e.g. `"6"` or `"0,1"` |
+| `env` | Additional environment variables; values are strings or integers; named runtime settings take precedence |
+
+The child inherits the launcher's environment. HF offline mode affects model/tokenizer downloads, **not** the HTTP search/reader API. Snippet generation in BM25, Dense, and online MCP now uses character slicing and loads no snippet tokenizer. Dense still requires its embedding model and query-encoding tokenizer; prepare their caches beforehand or use a compatible local `model_name` directory. HF offline settings can remain in shared configuration for Dense. Do not enable HF offline mode while first downloading models/indexes.
+
+| Common `args` field | Default/meaning |
+| --- | --- |
+| `port` | Required by the grouped launcher; must be unique within selected services |
+| `transport` | `sse` by default; grouped serving also supports `streamable-http`, not `stdio` |
+| `k` | Default `5`; fallback when an Agent omits Tool argument `k`, not a fixed per-service result cap |
+| `snippet_max_chars` | Default `2048` Unicode characters per result; `-1` disables truncation; positive integers otherwise |
+| `get_document` | Offline only; set `true` to register `read_document`; online always registers it |
+| `host` | Online only; worker default `0.0.0.0`, example uses `127.0.0.1` |
+
+`--check` does not instantiate Providers, validate every backend CLI option, load indexes/models, check port availability, or contact upstream APIs. Unknown worker arguments and deeper configuration errors can therefore still fail at startup. Do not set `args.config`, `args.searcher_type`, or `args.hf_token`: use `provider`, `backend`, and the `HF_TOKEN` environment variable respectively.
+
+### Offline: manifests, Flat, and ANN
+
+The YAML launcher preserves both existing index configuration modes:
+
+- **Manifest mode:** set `args.corpus: my-corpus`; `corpora/my-corpus/manifest.json` supplies index/model settings. The launcher rejects combining `corpus` with `index_path`, `model_name`, `pooling`, `normalize`, `torch_dtype`, `lookup_path`, `index_type`, `nprobe`, `task_prefix`, or `max_length`. The manifest remains authoritative. BM25 can use an explicit `document_store` for reading. Snippet generation no longer derives or loads a tokenizer from the manifest; Dense query encoding is unchanged.
+- **Explicit mode:** use the paths and model settings shown in the full example. Keep the query model, pooling, normalization, dtype, and query prefix compatible with the index.
+
+| Offline `args` | Use |
+| --- | --- |
+| `index_path`, `document_store` | BM25 Lucene directory or FAISS input; SQLite store for document access |
+| `bm25_workers` | BM25 thread workers; default `1`, deployment example `16` |
+| `index_type` | FAISS `flat` (default) or `ivf-flat` |
+| `lookup_path`, `nprobe` | IVF-Flat docid mapping and lists probed; `nprobe` default `32` |
+| `model_name`, `pooling`, `normalize`, `torch_dtype` | Query embedding settings; match the built index |
+| `task_prefix`, `max_length` | Query instruction and token length; FAISS length default `8192` |
+| `corpus_path`, `dataset_name` | Alternative FAISS document sources; prefer local `document_store` to avoid dataset loading |
+| `dense_max_batch_size` | Default `16` requests per batch |
+| `dense_max_wait_ms` | Default `5` ms; deployment example `1` ms |
+| `dense_max_queue_size` | Default `64` pending requests |
+
+ANN is a Dense index choice, not another online Provider. For an existing IVF-Flat index, replace the Flat index fields in the Dense service with:
+
+```yaml
+index_type: ivf-flat
+index_path: indexes/corpora/my-corpus/qwen3-embedding-0.6b/index.ivf-flat.faiss
+lookup_path: indexes/corpora/my-corpus/qwen3-embedding-0.6b/index.lookup.pkl
+nprobe: 32
+```
+
+Also use that corpus's document store and matching model parameters. `nlist` and training parameters belong to index construction, not serving. Do not pass IVF-only paths to Flat search.
+
+Direct worker invocation remains available for debugging and offline `stdio` clients:
 
 ```bash
-MODEL_NAME=Qwen/Qwen3-Embedding-0.6B
-POOLING=eos
-DENSE_INDEX_DIR=indexes/corpora/my-corpus/qwen3-embedding-0.6b
-DOCUMENT_STORE=corpora/my-corpus/documents.sqlite
-GPU_ID=0
-PORT=8081
-
-CUDA_VISIBLE_DEVICES="$GPU_ID" \
-python searcher/mcp_server.py \
-  --searcher-type faiss \
-  --index-type ivf-flat \
-  --index-path "$DENSE_INDEX_DIR/index.ivf-flat.faiss" \
-  --lookup-path "$DENSE_INDEX_DIR/index.lookup.pkl" \
-  --nprobe 32 \
-  --model-name "$MODEL_NAME" \
-  --pooling "$POOLING" \
-  --normalize \
-  --document-store "$DOCUMENT_STORE" \
-  --get-document \
-  --transport sse \
-  --port "$PORT"
+python3 searcher/mcp_server.py --help --searcher-type bm25
+python3 searcher/mcp_server.py --help --searcher-type faiss
+python3 searcher/online_mcp_server.py --help
 ```
 
-### Recommended serving parameters
+The direct online worker's `--config` accepts JSON shaped as `{"provider":"iqs","providers":{"iqs":{...}}}`, **not** the service YAML. The launcher translates YAML to a temporary permission-`600` JSON file automatically. Prefer the launcher for normal operation.
 
-These values performed well in the validated deployment. They are starting points, not hardware-independent guarantees.
+Historical offline performance reference points on the validated BrowseComp deployment were BM25 ~43 QPS (p50 ~176 ms, p95 ~251 ms) and Dense ~35–36 QPS (p50 ~862 ms, p95 ~1.1 s). These are not fresh measurements or online API throughput guarantees; compare only equivalent corpus/hardware/concurrency conditions.
 
-| Area | Parameter | Recommended value | Code default |
-| --- | --- | ---: | ---: |
-| BM25 | `--bm25-workers` | 16 | 1 |
-| BM25 | Client request concurrency | 8 | N/A |
-| Dense | `--dense-max-batch-size` | 16 | 16 |
-| Dense | `--dense-max-wait-ms` | 1 ms | 5 ms |
-| Dense | `--dense-max-queue-size` | 64 | 64 |
-| Dense | Client request concurrency | 32 | N/A |
-| MCP | `--transport` | `sse` | `sse` |
-| Search | `--k` | 5 | 5 |
-| Search | `--snippet-max-tokens` | 512 | 512 |
-| Read | Chunk size | 8,192 characters | 8,192 characters |
+## Tool output contract
 
-Observed regression reference points on the validated hardware and BrowseComp corpus were approximately:
+### `search(query: str, k: int = 5)`
+
+Returns a JSON array with up to `k` entries:
+
+```json
+[
+  {"docid": "web_<sha256-of-url>", "score": null, "snippet": "A bounded preview."}
+]
+```
+
+| Field | Type/meaning |
+| --- | --- |
+| `docid` | String; corpus ID offline, generated URL ID online |
+| `score` | Number or `null`; online currently always returns `null`, even if an upstream API supplies a score |
+| `snippet` | String preview, sliced by Unicode character count; no snippet tokenizer |
+
+Search does **not** expose `metadata`, URL/title/source/language, `char_count`, or chunk counts. Each result uses `text[:snippet_max_chars]` (offline document text) or `snippet[:snippet_max_chars]` (online API snippet). Length is measured in Python Unicode code points, not UTF-8 bytes, tokens, words, or natural paragraphs. The old 8192-character pre-guard and token encode/decode stages are removed. Short text stays unchanged; `-1` returns the full source string. This does not change the separate 8192-character `read_document` chunk size.
+
+`k` is visible to the Agent as an integer greater than zero. The schema default is taken from YAML `args.k` at startup (5 in the example). A call such as `{"query":"history","k":7}` asks for up to seven results; omitting `k` uses that default. BM25 passes k to Lucene, and Dense passes it to FAISS. Mixed-k Dense requests share a batch using its largest k, then each result list is sliced to its own requested size. Online passes k to the Provider and limits the public list to at most k. Fewer hits may be available; IQS rejects values outside 1–50, and other vendor restrictions still apply.
+
+Migration: replace `snippet_max_tokens: 512` with `snippet_max_chars: 2048` and remove `snippet_tokenizer` from both defaults and per-service overrides. Replace old CLI flags with `--snippet-max-chars`; the old MCP snippet flags are no longer accepted. 2048 characters is only a rough replacement for 512 tokens, not a language-independent equivalence. Restart after configuration changes; clients may need to reconnect/refresh their Tool schemas. The separate `search_r1_server.py` endpoint is outside this MCP change.
+
+### `read_document(docid: str, chunk_index: int = 0)`
+
+The following is a complete, internally consistent final-chunk example:
+
+```json
+{
+  "docid": "doc-example",
+  "chunk_index": 0,
+  "metadata": {"char_count": 5, "chunk_size_chars": 8192, "chunk_count": 1},
+  "char_start": 0,
+  "char_end": 5,
+  "has_more": false,
+  "next_chunk_index": null,
+  "text": "Hello"
+}
+```
+
+- Indices are zero-based. `char_start` is inclusive and `char_end` exclusive; `len(text) == char_end - char_start` using Python Unicode code points, not UTF-8 bytes, tokens, or paragraph boundaries.
+- The MCP chunk size is fixed at `8192`; it is not a YAML tuning field. `chunk_count = max(1, ceil(char_count / 8192))`.
+- Follow `next_chunk_index` while `has_more` is true. The last chunk has `next_chunk_index: null`.
+- Read `metadata` contains only `char_count`, `chunk_size_chars`, and `chunk_count`. Counts describe the available document text (the Provider-returned text online), not an independently verified full copy of the website.
+- Unknown/expired online IDs and invalid/out-of-range chunk indices fail. The offline base reader can return `null` for a missing document; error payloads are not yet identical across all backends. Clients should handle both tool errors and missing results.
+
+Migration from older clients: use `read_document`, not a `get_document` tool; `get_document: true` remains only the offline registration flag. Move length/chunk logic from search results to read results, allow `score: null`, and do not depend on the removed public URL/title/source/language fields. Internal metadata/document-store columns have not been removed.
+
+## Online APIs and cache
+
+### Credentials and provider-specific settings
+
+The bundled adapters bind search and reader capabilities to the same vendor. `provider.name` is a registry key, not an arbitrary import path. A nonempty literal `provider.api_key` takes precedence; otherwise the adapter reads the environment variable named by `api_key_env`. There is no `${...}` substitution and the online worker does not automatically load a `.env` file.
+
+| Common `provider` field | Meaning |
+| --- | --- |
+| `name` | Registered adapter: currently `zhipu` or `iqs` |
+| `api_key`, `api_key_env` | Literal secret or the name of its environment variable |
+| `base_url` | Trusted vendor API base; defaults to the corresponding URL in the example |
+| `timeout_seconds` | HTTP client timeout, default `60` seconds; IQS also validates it against its page timeout |
+| `search`, `read` | Vendor-specific request options; unknown option names are rejected |
+
+To enter a key into the existing YAML without echoing it or placing it in shell history (choose `iqs` or `online` at the prompt):
+
+```bash
+python3 - <<'PY'
+import getpass
+from pathlib import Path
+import yaml
+from searcher.serve import UniqueLoader
+
+path = Path("configs/services.local.yaml")
+config = yaml.load(path.read_text(encoding="utf-8"), Loader=UniqueLoader)
+# stdin contains this script; use the terminal explicitly for interactive input.
+with open("/dev/tty", "r+") as terminal:
+    terminal.write("Service name (iqs or online): ")
+    terminal.flush()
+    name = terminal.readline().strip()
+if name not in {"iqs", "online"} or name not in config["services"]:
+    raise SystemExit("Unknown service; unchanged")
+key = getpass.getpass("API key (hidden): ").strip()
+if not key:
+    raise SystemExit("Empty key; unchanged")
+config["services"][name]["provider"]["api_key"] = key
+path.chmod(0o600)
+path.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
+print("Saved. Restart the service group to apply.")
+PY
+```
+
+This rewrites YAML formatting/comments. Keep local YAML, backups, temporary credential files, and runtime logs out of version control and shared artifacts; verify exclusion rules rather than assuming they exist. Use sanitized examples in documentation. Do not send your key in issue reports. Use trusted HTTPS API endpoints, especially when changing `base_url`.
+
+| Adapter | Search | Reader | Configuration differences |
+| --- | --- | --- | --- |
+| `zhipu` | `web_search` → `search_result` | `reader` → `reader_result.content` | `search_engine`, `search_intent`, `count`, `search_recency_filter`, `content_size` |
+| `iqs` | `search/unified` → `pageItems` | `readpage/basic` → `data.text` | `engineType`, `timeRange`, optional `category`, `advancedParams` |
+
+Zhipu `search_recency_filter`: `oneDay`, `oneWeek`, `oneMonth`, `oneYear`, `noLimit`. Reader options are `no_cache`, `return_format` (must be `text`), `retain_images`, `with_images_summary`, and `with_links_summary`.
+
+IQS `timeRange`: `OneDay`, `OneWeek`, `OneMonth`, `OneYear`, `NoLimit` (case differs from Zhipu). The adapter accepts `Generic`, `GenericAdvanced`, `LiteAdvanced`, and `Deep` engines. `advancedParams` supports `numResults` (1–50; the selected engine may impose its own behavior), `startPublishedDate`, and `endPublishedDate` (`YYYY-MM-DD`). The request asks for snippets without `mainText`, `markdownText`, `richMainBody`, or `summary`; `rerankScore` is requested for upstream ranking but not exposed as the public `score`.
+
+IQS reading currently supports **Basic only**. Its YAML options are `pageTimeout` (0–100000 milliseconds), `maxAge` (nonnegative seconds), `readability.readabilityMode` (`none`, `normal`, `article`), `excludeAllImages`, `excludeAllLinks`, and `excludedTags`. `formats: [text]` is fixed in the adapter, not configurable. `timeout_seconds` must exceed `(pageTimeout + 6000) / 1000`. Non-success target `data.statusCode` and empty text are errors, not cached documents. Search long-text fields are not used as a substitute for lazy reading.
+
+MCP calls override Zhipu `search.count` and IQS `advancedParams.numResults` with the request's k (or YAML `args.k` when omitted). The configured vendor counts remain only as fallbacks for direct adapter calls that omit k; they no longer limit or fix MCP requests at 10. Upstream caps, filters, and empty results can return fewer hits. `read.no_cache: true` (Zhipu) or `read.maxAge: 0` (IQS) disables the vendor-side cache, **not** this server's cache. The available extracted text may still be incomplete because of access restrictions, dynamic rendering, or the provider's extraction behavior.
+
+Official references: [Zhipu Web Search](https://open.bigmodel.cn/api/paas/v4/web_search) (API endpoint), [IQS HTTP quick start](https://help.aliyun.com/zh/document_detail/2870227.html), [IQS search parameters](https://help.aliyun.com/zh/document_detail/2883041.html), [IQS Basic reader](https://help.aliyun.com/zh/document_detail/2983380.html).
+
+### Lifecycle and limits
 
 ```text
-BM25:  ~43 QPS, p50 ~176 ms, p95 ~251 ms
-Dense: ~35–36 QPS, p50 ~862 ms, p95 ~1.1 s
+search(query, k) → Provider.search(query, k) → URL registration → stable docid + snippet
+read_document → docid lookup → cached text OR Provider.read(URL)
+              → character counts → requested 8192-character chunk
 ```
 
-Results depend on the corpus, CPU, GPU, index type, client sessions, and network path. Investigate a regression when comparable tests fall substantially below approximately 38 QPS for BM25 or 30 QPS for dense retrieval.
+IDs use `web_` plus the SHA-256 hex digest of the **exact URL string**. URL variants are not canonicalized; identical content under different URLs can have different IDs. Only returned search hits are registered. Repeating a URL yields the same ID but still needs a live mapping in that service process.
 
-### Transport and MCP endpoint
+| Online `args` field | Default | Meaning |
+| --- | ---: | --- |
+| `content_cache_idle_ttl_seconds` | `1800` | Idle expiry of cached bodies; successful cached reads refresh access time |
+| `content_cache_max_mib` | `256` | Sum of cached body UTF-8 bytes, in MiB; LRU eviction when necessary |
+| `mapping_idle_ttl_seconds` | `86400` | Idle expiry of docid → URL mappings |
+| `mapping_max_entries` | `100000` | Maximum mapping entries; least-recently-used entries evicted |
+| `cache_cleanup_interval_seconds` | `60` | Background cleanup interval; requests also purge expired entries |
 
-Supported transports are:
+All values must be positive; capacity/count fields are integers. Keep mapping TTL substantially longer than body TTL. Mapping access is refreshed by search registration and known-ID read attempts. Body eviction leaves its mapping available; mapping eviction also drops its cached body. An unknown mapping requires another search. One body larger than the entire configured capacity is rejected; it is not truncated to fit.
 
-```text
-stdio
-sse
-streamable-http
+The byte budget is **not** a process RSS cap: Python objects, metadata, mappings, and in-flight responses add memory overhead. Concurrent reads of the same uncached ID share one fetch within a process; different IDs are not globally rate-limited by this cache. Failed fetches are not cached and can be retried by a later request; the adapters do not implement an automatic retry/backoff loop.
+
+Cache scope is one service process, shared across MCP connections, not one connection or rollout. There is no rollout-end signal, persistence, cross-worker sharing, or tenant isolation. Disconnecting a client does not clear the cache; restarting the process clears bodies and mappings. After body expiry/refetch a page can change, so old chunk numbers may refer to different content. Version pinning is intentionally not provided.
+
+## Adding a Provider
+
+New vendors require a small code adapter; existing registered vendors are selected by YAML and restart. Do not try to express arbitrary authentication, nested response parsing, and error semantics as field-name substitutions alone.
+
+1. Add `searcher/providers/<vendor>.py` with a class accepting a provider-specific configuration dictionary. Validate allowed keys and values, resolve credentials, and own one reusable asynchronous HTTP client.
+2. Implement the normalized internal contract below, including per-call k. Map it to the vendor's count parameter using a new request dictionary (copy nested options too); do not mutate shared configuration during concurrent calls. Validate vendor-specific bounds rather than silently ignoring k. Return extracted document text, not the search snippet, from `read`. A dedicated upstream endpoint named “reader” is not required, but document retrieval must remain meaningful after body eviction. If a vendor only embeds text in search results, explicitly design the refetch strategy instead of silently returning summaries as full documents.
+3. Import/register the class in `searcher/providers/registry.py`, e.g. `PROVIDERS["vendor"] = VendorProvider` alongside the existing entries. Keep `__init__.py` and the `online_provider.py` compatibility facade unless there is a concrete reason to change them.
+4. Add a service with `backend: online`, a free port, and `provider.name: vendor`. Vendor-specific options stay under `provider.search`/`provider.read`; shared cache/snippet settings remain under `args`. Time filters currently are startup settings, not extra Agent `search` arguments.
+5. Run mock adapter tests, the shared cache tests below, and real MCP search/read acceptance with the vendor's key. Restart after changing code/configuration. Neither the shared tools nor the launcher should need vendor-specific branches.
+
+```python
+class VendorProvider:
+    def __init__(self, config: dict): ...
+
+    async def search(self, query: str, k: int) -> list[dict]:
+        # Pass k to the upstream request without mutating shared options.
+        # Required per item: url (absolute HTTP(S)), snippet (string).
+        # Optional: title, source, language, publish_date.
+        ...
+
+    async def read(self, url: str) -> dict:
+        # Required: text (nonempty string).
+        # Optional: url, title, source, language.
+        ...
+
+    async def close(self) -> None:
+        # Close owned HTTP clients/resources.
+        ...
 ```
 
-The HTTP path configured by this server is `/mcp`. For example:
+Raise on HTTP/network/API failures, malformed responses, blocked target pages, or missing body text. An actual empty search returns `[]`; do not turn an API failure into an empty success. Avoid blocking I/O and credential/full-response logging. HTTP error handling, timeout/rate-limit policy, vendor defaults, extraction limits, and language/title mapping are adapter responsibilities. The shared layer owns IDs, public `score: null`, snippet truncation, caches, and chunks.
 
-```text
-http://127.0.0.1:<port>/mcp
+Adapter mock coverage should check exact URL/method/auth/body fields, nested response mapping, empty search, missing/invalid fields, non-2xx responses, vendor error codes, reader target failures, long Unicode text, and client cleanup. `httpx.MockTransport` can exercise these without credentials or charges. Shared cache tests do not replace vendor-specific response tests.
+
+## Acceptance tests
+
+### 1. Static and startup checks
+
+```bash
+python3 -m py_compile searcher/serve.py searcher/tools.py searcher/searchers/base.py \
+  searcher/online_mcp_server.py searcher/online_service.py \
+  searcher/providers/base.py searcher/providers/registry.py \
+  searcher/providers/zhipu.py searcher/providers/iqs.py
+python3 searcher/serve.py --config configs/services.local.yaml --all --check
 ```
 
-SSE is the tested recommendation for this dependency set. Streamable HTTP remains available for compatible clients.
+Launch the chosen group and wait for `READY`. This does not make paid search/read calls. The following real API tests do, and results are live/non-deterministic.
+
+### 2. Search, cross-connection read, and chunk boundaries
+
+The test uses explicit `SSETransport` and `/mcp`. `/sse` is not this server's endpoint; constructing `Client(url)` for an SSE server may incorrectly select Streamable HTTP and produce HTTP 405. For a service deliberately started with `streamable-http`, use `Client(URL)` instead.
+
+Save and run the following from the repository root. It prints complete results and validates the field contract. Change `MCP_URL` to test another service. `EXPECT_ONLINE=0` permits offline numeric scores; `REQUESTED_K` sets the per-call result count and `SNIPPET_MAX_CHARS` must match the server's configured character limit.
+
+```bash
+cat > /tmp/retrieval_mcp_smoke.py <<'PY'
+import asyncio
+import json
+import os
+
+from fastmcp import Client
+from fastmcp.client.transports import SSETransport
+
+URL = os.environ.get("MCP_URL", "http://127.0.0.1:8083/mcp")
+QUERY = os.environ.get("TEST_QUERY", "Context Folding LLM Agent")
+ONLINE = os.environ.get("EXPECT_ONLINE", "1") == "1"
+K = int(os.environ.get("REQUESTED_K", "7"))
+SNIPPET_MAX_CHARS = int(os.environ.get("SNIPPET_MAX_CHARS", "2048"))
+
+
+def decode(result):
+    if getattr(result, "is_error", False) or getattr(result, "isError", False):
+        raise RuntimeError(str(result))
+    blocks = result.content if hasattr(result, "content") else result
+    for block in blocks:
+        if getattr(block, "type", None) == "text":
+            try:
+                return json.loads(block.text)
+            except json.JSONDecodeError:
+                continue
+    raise RuntimeError(f"No JSON text in result: {result}")
+
+
+async def call(name, arguments):
+    async with Client(SSETransport(URL)) as client:
+        return decode(await client.call_tool(name, arguments))
+
+
+def check_chunk(result, docid, index):
+    assert set(result) == {
+        "docid", "chunk_index", "metadata", "char_start", "char_end",
+        "has_more", "next_chunk_index", "text",
+    }, result
+    assert result["docid"] == docid and result["chunk_index"] == index
+    metadata = result["metadata"]
+    assert set(metadata) == {"char_count", "chunk_size_chars", "chunk_count"}
+    total = metadata["char_count"]
+    count = metadata["chunk_count"]
+    assert type(total) is int and total >= 0
+    assert metadata["chunk_size_chars"] == 8192
+    assert count == max(1, (total + 8191) // 8192)
+    assert result["char_start"] == index * 8192
+    assert result["char_end"] == min((index + 1) * 8192, total)
+    assert len(result["text"]) == result["char_end"] - result["char_start"]
+    assert result["has_more"] is (index + 1 < count)
+    assert result["next_chunk_index"] == (index + 1 if index + 1 < count else None)
+
+
+async def main():
+    rows = await call("search", {"query": QUERY, "k": K})
+    print("=== search ===")
+    print(json.dumps(rows, ensure_ascii=False, indent=2))
+    assert isinstance(rows, list) and 0 < len(rows) <= K
+    for row in rows:
+        assert set(row) == {"docid", "score", "snippet"}
+        assert isinstance(row["docid"], str) and isinstance(row["snippet"], str)
+        if SNIPPET_MAX_CHARS != -1:
+            assert len(row["snippet"]) <= SNIPPET_MAX_CHARS
+        assert row["score"] is None or type(row["score"]) in (int, float)
+        if ONLINE:
+            assert row["score"] is None
+
+    docid = rows[0]["docid"]
+    first = await call("read_document", {"docid": docid, "chunk_index": 0})
+    check_chunk(first, docid, 0)
+    print("=== read_document ===")
+    print(json.dumps(first, ensure_ascii=False, indent=2))
+    if first["has_more"]:
+        second = await call("read_document", {"docid": docid, "chunk_index": 1})
+        check_chunk(second, docid, 1)
+        assert first["char_end"] == second["char_start"]
+        assert first["metadata"] == second["metadata"]
+        print("PASS: cross-connection chunk boundary")
+    else:
+        print("SKIP: multi-chunk boundary (single-chunk document)")
+
+    last_index = first["metadata"]["chunk_count"] - 1
+    last = await call("read_document", {"docid": docid, "chunk_index": last_index})
+    check_chunk(last, docid, last_index)
+    assert last["has_more"] is False and last["next_chunk_index"] is None
+    print("PASS: search/read fields, cross-connection reading, final chunk")
+
+
+asyncio.run(main())
+PY
+
+python3 -m py_compile /tmp/retrieval_mcp_smoke.py
+MCP_URL=http://127.0.0.1:8083/mcp EXPECT_ONLINE=1 REQUESTED_K=7 SNIPPET_MAX_CHARS=2048 \
+  python3 /tmp/retrieval_mcp_smoke.py
+```
+
+Each read opens a new MCP connection. For a single-chunk document the test explicitly skips the multi-chunk boundary check; choose a longer document/query to exercise it. The assertions assume the cached document has not expired between reads.
+
+### 3. Online cache and failure acceptance
+
+For real TTL behavior, use a **temporary test service/config**, set `content_cache_idle_ttl_seconds: 10`, keep mapping TTL longer (e.g. `300`), and restart it. Search once, save the docid, read chunk 0, immediately read it again, wait at least 12 seconds without reading, then read the **same ID without another search**. Check the service log for `Reader fetch`, `Reader cache hit`, and a later `Reader fetch`. Do not assert content equality after refetch. Restore production TTL afterwards; changing the YAML alone does not alter a running process.
+
+To check single-flight live, read a freshly searched, uncached ID from three concurrent independent connections. Expect equal text from that fetch and exactly one new `Reader fetch` log entry. Sequential requests or a warm cache do not prove single-flight behavior.
+
+The deterministic test below covers lazy reads, concurrent single-flight, TTL, LRU eviction, mapping expiry/capacity, failure-then-retry, oversized bodies, and bad indices without paid requests, network, or HF downloads. It runs directly against `OnlineService`, with character truncation disabled solely for the cache test. It advances stored timestamps rather than sleeping through real TTLs.
+
+```bash
+cat > /tmp/test_retrieval_online_cache.py <<'PY'
+import asyncio
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path.cwd() / "searcher"))
+from online_service import OnlineService
+
+
+class FakeProvider:
+    def __init__(self):
+        self.calls = []
+        self.fail_once = False
+        self.closed = False
+        self.body = "正文🙂" * 4000
+
+    async def search(self, query, k):
+        return [{"url": f"https://example.com/{query}", "snippet": "preview"}]
+
+    async def read(self, url):
+        self.calls.append(url)
+        await asyncio.sleep(0)
+        if self.fail_once:
+            self.fail_once = False
+            raise RuntimeError("simulated upstream failure")
+        return {"text": self.body, "url": url}
+
+    async def close(self):
+        self.closed = True
+
+
+class CacheTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.provider = FakeProvider()
+        self.service = OnlineService(
+            self.provider, snippet_max_chars=-1,
+            content_ttl=10, mapping_ttl=300,
+        )
+
+    async def asyncTearDown(self):
+        await self.service.close()
+        self.assertTrue(self.provider.closed)
+
+    async def docid(self, query):
+        return (await self.service.search(query))[0]["docid"]
+
+    async def test_lazy_stable_id_single_flight_and_chunks(self):
+        docid = await self.docid("a")
+        self.assertEqual(await self.docid("a"), docid)
+        self.assertEqual(self.provider.calls, [])
+        results = await asyncio.gather(*[
+            self.service.read_document(docid, 0) for _ in range(3)
+        ])
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[1], results[2])
+        self.assertEqual(len(self.provider.calls), 1)
+        first = results[0]
+        second = await self.service.read_document(docid, 1)
+        self.assertEqual(first["char_end"], second["char_start"])
+        self.assertEqual(first["text"] + second["text"], self.provider.body)
+        self.assertEqual(second["metadata"]["char_count"], 12000)
+        self.assertFalse(second["has_more"])
+        self.assertIsNone(second["next_chunk_index"])
+        self.assertEqual(len(self.provider.calls), 1)
+
+    async def test_body_idle_expiry_keeps_mapping(self):
+        docid = await self.docid("a")
+        await self.service.read_document(docid)
+        self.service.contents[docid]["last_access"] -= 11
+        await self.service.read_document(docid)
+        self.assertEqual(len(self.provider.calls), 2)
+        self.assertIn(docid, self.service.documents)
+
+    async def test_lru_body_eviction(self):
+        self.provider.body = "abc"
+        self.service.max_bytes = 6
+        a, b, c = [await self.docid(q) for q in ("a", "b", "c")]
+        await self.service.read_document(a)
+        await self.service.read_document(b)
+        await self.service.read_document(a)
+        await self.service.read_document(c)
+        self.assertIn(a, self.service.contents)
+        self.assertNotIn(b, self.service.contents)
+        self.assertIn(b, self.service.documents)
+        await self.service.read_document(b)
+        self.assertEqual(len(self.provider.calls), 4)
+
+    async def test_mapping_expiry_drops_body(self):
+        docid = await self.docid("a")
+        await self.service.read_document(docid)
+        self.service.documents[docid]["last_access"] -= 301
+        with self.assertRaises(ValueError):
+            await self.service.read_document(docid)
+        self.assertNotIn(docid, self.service.contents)
+        self.assertEqual(await self.docid("a"), docid)
+        await self.service.read_document(docid)
+        self.assertEqual(len(self.provider.calls), 2)
+
+    async def test_mapping_capacity(self):
+        self.service.mapping_limit = 1
+        a = await self.docid("a")
+        await self.service.read_document(a)
+        await self.docid("b")
+        self.assertNotIn(a, self.service.documents)
+        self.assertNotIn(a, self.service.contents)
+
+    async def test_failure_not_cached_later_retry_succeeds(self):
+        docid = await self.docid("a")
+        self.provider.fail_once = True
+        with self.assertRaises(RuntimeError):
+            await self.service.read_document(docid)
+        self.assertNotIn(docid, self.service.contents)
+        self.assertNotIn(docid, self.service.inflight)
+        await self.service.read_document(docid)
+        self.assertEqual(len(self.provider.calls), 2)
+
+    async def test_bad_requests_do_not_break_service(self):
+        docid = await self.docid("a")
+        for target, index in (("web_missing", 0), (docid, -1), (docid, 2)):
+            with self.assertRaises(ValueError):
+                await self.service.read_document(target, index)
+        result = await self.service.read_document(docid, 0)
+        self.assertEqual(result["chunk_index"], 0)
+
+    async def test_oversized_document_not_cached(self):
+        self.service.max_bytes = 2
+        docid = await self.docid("a")
+        with self.assertRaises(RuntimeError):
+            await self.service.read_document(docid)
+        self.assertNotIn(docid, self.service.contents)
+
+
+if __name__ == "__main__":
+    unittest.main()
+PY
+
+python3 -m py_compile /tmp/test_retrieval_online_cache.py
+python3 -m unittest discover -s /tmp -p test_retrieval_online_cache.py -v
+```
+
+### Acceptance record and boundaries
+
+The development deployment has reported successful online field checks, Zhipu cross-connection/chunk/TTL/concurrency/error checks, mock LRU/mapping/failure tests, and real IQS search followed by read. These are historical development results, not a guarantee for a fresh installation or every vendor engine. For the per-call-k/character-snippet change, the user additionally reported all four services exposing integer k with default 5 and a positive constraint, returning exactly 2 and 7 hits for k=2 and k=7, with every snippet at most 2048 characters. This verifies the core search changes; it does not prove that mixed-k Dense requests entered the same GPU batch or cover all boundaries/performance. No live tests were rerun by the assistant for this documentation synchronization. Record the date, dependency versions, non-secret configuration, backend/provider, test results, and fetch counts for each deployment. Never include API keys.
+
+Remaining operational checks depend on deployment needs: vendor throttling/auth/network failures, sustained load and memory overhead, dynamic/blocked pages, multiple service groups, and client compatibility. `READY` and a successful smoke test do not replace retrieval-quality evaluation. Re-run offline smoke tests after shared Tool changes and provider-specific mocks after adapter changes.
 
 ## Building a local corpus
 
@@ -971,7 +1450,7 @@ exclude_files:
 
 `--keep-build-files` retains the temporary Pyserini input. Without that flag, successful BM25 construction removes the corpus `.build` directory automatically.
 
-Deleting IVF-Flat embedding shards does not affect online retrieval, but a future ANN rebuild will require re-encoding the corpus. If shards are removed, the manifest's `embeddings_built` state should be updated accordingly.
+Deleting IVF-Flat embedding shards does not affect serving that local ANN index, but a future ANN rebuild will require re-encoding the corpus. If shards are removed, the manifest's `embeddings_built` state should be updated accordingly.
 
 Generated corpora, indexes, models, caches, virtual environments, and runtime logs should not be committed to Git. Commit source code, configuration templates, `pyproject.toml`, `uv.lock`, and documentation instead.
 

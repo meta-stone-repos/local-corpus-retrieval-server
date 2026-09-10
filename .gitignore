@@ -63,3 +63,8 @@ core.*
 *.bak
 *.orig
 *~
+
+# Local retrieval configuration and credential backups
+/configs/*.local.yaml
+/configs/*.local.yaml.bak-*
+/configs/online_zhipu.json

@@ -1,29 +1,30 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
 from fastmcp import FastMCP
 from searchers.base import BaseSearcher
-from transformers import AutoTokenizer
+from pydantic import Field
 
 
 def register_tools(
     mcp: FastMCP,
     searcher: BaseSearcher,
-    snippet_max_tokens: int | None = None,
+    snippet_max_chars: int = 2048,
     k: int = 5,
     include_get_document: bool = True,
     bm25_workers: int = 1,
     dense_max_batch_size: int = 16,
     dense_max_wait_ms: float = 5.0,
     dense_max_queue_size: int = 64,
-    snippet_tokenizer: str | None = None,
 ):
-    tokenizer = None
-    if snippet_max_tokens and snippet_max_tokens > 0:
-        tokenizer = AutoTokenizer.from_pretrained(
-            snippet_tokenizer or "Qwen/Qwen3-0.6B"
-        )
+    if type(k) is not int or k <= 0:
+        raise ValueError("Default k must be a positive integer")
+    if (
+        type(snippet_max_chars) is not int
+        or (snippet_max_chars != -1 and snippet_max_chars <= 0)
+    ):
+        raise ValueError("snippet_max_chars must be positive or -1")
 
     # BM25 uses multiple CPU workers.
     # Dense keeps exactly one backend worker; concurrency is achieved
@@ -50,216 +51,42 @@ def register_tools(
 
     READ_CHUNK_SIZE_CHARS = 8192
 
-    def _build_search_metadata(
-        cand: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Add serving-side document reading metadata."""
-        metadata = dict(cand.get("metadata") or {})
-
-        char_count = metadata.get("char_count")
-
-        # Fallback for searchers/document sources without precomputed metadata.
-        if char_count is None:
-            text = cand.get("text") or ""
-            char_count = len(text)
-
-        char_count = int(char_count)
-
-        chunk_count = max(
-            1,
-            (
-                char_count
-                + READ_CHUNK_SIZE_CHARS
-                - 1
-            )
-            // READ_CHUNK_SIZE_CHARS,
-        )
-
-        metadata["char_count"] = char_count
-        metadata["chunk_size_chars"] = READ_CHUNK_SIZE_CHARS
-        metadata["chunk_count"] = chunk_count
-
-        return metadata
-
-    def _format_candidates(
-        candidates: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        """Apply snippet truncation and produce MCP-facing results."""
-        if snippet_max_tokens and snippet_max_tokens > 0 and tokenizer:
-            # Avoid feeding pathological full documents into the tokenizer
-            # when we only need a short preview.
-            raw_char_limit = max(
-                snippet_max_tokens * 16,
-                8192,
-            )
-
-            for cand in candidates:
-                text = cand["text"]
-
-                guarded_text = text[:raw_char_limit]
-
-                tokens = tokenizer.encode(
-                    guarded_text,
-                    add_special_tokens=False,
-                    truncation=True,
-                    max_length=snippet_max_tokens,
-                )
-
-                cand["snippet"] = tokenizer.decode(
-                    tokens,
-                    skip_special_tokens=True,
-                )
-        else:
-            for cand in candidates:
-                cand["snippet"] = cand["text"]
-
+    def _format_candidates(candidates):
         results = []
-
         for cand in candidates:
-            if cand.get("score") is None:
-                results.append(
-                    {
-                        "docid": cand["docid"],
-                        "snippet": cand["snippet"],
-                        "metadata": _build_search_metadata(cand),
-                    }
-                )
-            else:
-                results.append(
-                    {
-                        "docid": cand["docid"],
-                        "score": cand["score"],
-                        "snippet": cand["snippet"],
-                        "metadata": _build_search_metadata(cand),
-                    }
-                )
-
+            body = cand["text"]
+            snippet = (
+                body if snippet_max_chars == -1
+                else body[:snippet_max_chars]
+            )
+            results.append({
+                "docid": cand["docid"],
+                "score": (
+                    float(cand["score"])
+                    if cand.get("score") is not None else None
+                ),
+                "snippet": snippet,
+            })
         return results
 
-    def _format_batch_candidates(
-        batch_candidates: List[List[Dict[str, Any]]],
-    ) -> List[List[Dict[str, Any]]]:
-        """
-        Batch-format Dense retrieval results.
+    def _search_sync(query, requested_k):
+        candidates = searcher.search(query, requested_k)
+        return _format_candidates(candidates[:requested_k])
 
-        Unlike _format_candidates(), this tokenizes all Dense result
-        documents in one call and truncates during tokenization.
-        """
-        flat_candidates = [
-            cand
-            for candidates in batch_candidates
-            for cand in candidates
-        ]
-
-        if not flat_candidates:
-            return [[] for _ in batch_candidates]
-
-        if snippet_max_tokens and snippet_max_tokens > 0 and tokenizer:
-            # texts = [
-            #     cand["text"]
-            #     for cand in flat_candidates
-            # ]
-            # Raw-text guard before tokenization.
-# We only need a 512-token preview, so avoid feeding pathological
-# full documents (sometimes 100k+ tokens) into the tokenizer.
-            raw_char_limit = max(
-                snippet_max_tokens * 16,
-                8192,
-            )
-
-            texts = [
-                cand["text"][:raw_char_limit]
-                for cand in flat_candidates
-            ]
-
-            encoded = tokenizer(
-                texts,
-                add_special_tokens=False,
-                truncation=True,
-                max_length=snippet_max_tokens,
-                padding=False,
-                return_attention_mask=False,
-                return_token_type_ids=False,
-            )
-
-            snippets = tokenizer.batch_decode(
-                encoded["input_ids"],
-                skip_special_tokens=True,
-            )
-
-            for cand, snippet in zip(
-                flat_candidates,
-                snippets,
-            ):
-                cand["snippet"] = snippet
-
-        else:
-            for cand in flat_candidates:
-                cand["snippet"] = cand["text"]
-
-        batch_results = []
-        offset = 0
-
-        for candidates in batch_candidates:
-            results = []
-
-            for cand in candidates:
-                if cand.get("score") is None:
-                    results.append(
-                        {
-                            "docid": cand["docid"],
-                            "snippet": cand["snippet"],
-                            "metadata": _build_search_metadata(cand),
-                        }
-                    )
-                else:
-                    results.append(
-                        {
-                            "docid": cand["docid"],
-                            "score": cand["score"],
-                            "snippet": cand["snippet"],
-                            "metadata": _build_search_metadata(cand),
-                        }
-                    )
-
-            batch_results.append(results)
-            offset += len(candidates)
-
-        return batch_results
-
-
-    def _search_sync(
-        query: str,
-    ) -> List[Dict[str, Any]]:
-        candidates = searcher.search(query, k)
-        return _format_candidates(candidates)
-
-    # def _search_batch_sync(
-    #     queries: List[str],
-    # ) -> List[List[Dict[str, Any]]]:
-    #     """
-    #     Run one true Dense batch and format every query's result.
-
-    #     This function executes inside the single Dense backend worker.
-    #     """
-    #     batch_candidates = searcher.search_batch(queries, k)
-
-    #     return [
-    #         _format_candidates(candidates)
-    #         for candidates in batch_candidates
-    #     ]
-    def _search_batch_sync(
-        queries: List[str],
-    ) -> List[List[Dict[str, Any]]]:
-        """Run one true Dense batch and format its results."""
+    def _search_batch_sync(queries, requested_ks):
+        # One FAISS batch uses the largest requested k.
+        # Each request is sliced to its own k before formatting.
         batch_candidates = searcher.search_batch(
-            queries,
-            k,
+            queries, max(requested_ks)
         )
-
-        return _format_batch_candidates(
-            batch_candidates
-        )
+        if len(batch_candidates) != len(requested_ks):
+            raise RuntimeError("Dense batch result count mismatch")
+        return [
+            _format_candidates(candidates[:requested_k])
+            for candidates, requested_k in zip(
+                batch_candidates, requested_ks
+            )
+        ]
 
     # Enable dynamic batching only for a searcher that actually exposes
     # search_batch(). BM25 stays on its worker-pool path.
@@ -299,6 +126,7 @@ def register_tools(
         async def submit(
             self,
             query: str,
+            requested_k: int,
         ) -> List[Dict[str, Any]]:
             loop = asyncio.get_running_loop()
             future = loop.create_future()
@@ -308,6 +136,7 @@ def register_tools(
                     query,
                     future,
                     loop.time(),
+                    requested_k,
                 )
             )
 
@@ -416,6 +245,10 @@ def register_tools(
                     for item in active_items
                 ]
 
+                requested_ks = [
+                    item[3] for item in active_items
+                ]
+
                 try:
                     # Exactly one Dense backend execution at a time.
                     # Parallelism happens inside search_batch() on GPU.
@@ -423,6 +256,7 @@ def register_tools(
                         executor,
                         _search_batch_sync,
                         queries,
+                        requested_ks,
                     )
 
                     if len(batch_results) != len(futures):
@@ -475,6 +309,14 @@ def register_tools(
     )
     async def search(
         query: str,
+        k: Annotated[
+            int,
+            Field(
+                gt=0,
+                strict=True,
+                description="Maximum number of results to retrieve.",
+            ),
+        ] = k,
     ) -> List[Dict[str, Any]]:
         """
         Search the index and return top-k hits.
@@ -483,7 +325,7 @@ def register_tools(
         # enqueue the individual Agent request and let the scheduler
         # dynamically combine it with other requests.
         if dense_scheduler is not None:
-            return await dense_scheduler.submit(query)
+            return await dense_scheduler.submit(query, k)
 
         # BM25 / fallback path:
         # execute individual searches in the configured worker pool.
@@ -493,6 +335,7 @@ def register_tools(
             executor,
             _search_sync,
             query,
+            k,
         )
 
     if include_get_document:

@@ -91,11 +91,13 @@ class BaseSearcher(ABC):
         return {
             "docid": str(docid),
             "chunk_index": chunk_index,
-            "chunk_count": chunk_count,
-            "chunk_size_chars": chunk_size_chars,
             "char_start": char_start,
             "char_end": char_end,
-            "char_count": char_count,
+            "metadata": {
+                "char_count": char_count,
+                "chunk_size_chars": chunk_size_chars,
+                "chunk_count": chunk_count,
+            },
             "has_more": has_more,
             "next_chunk_index": chunk_index + 1 if has_more else None,
             "text": text[char_start:char_end],
@@ -106,7 +108,7 @@ class BaseSearcher(ABC):
         return (
             "Read one bounded chunk of a document by docid and chunk_index. "
             "Documents are split into fixed-size Unicode character chunks. "
-            "Use chunk_count and has_more to determine whether more chunks remain."
+            "Use metadata.chunk_count and has_more to determine whether more chunks remain."
         )
 
     @property
@@ -119,7 +121,12 @@ class BaseSearcher(ABC):
         """
         Description of the search tool to be passed to the LLM.
         """
-        return f"Perform a search on a knowledge source. Returns top-{k} hits with docid, score, and snippet. The snippet contains the document's contents (may be truncated based on token limits)."
+        return (
+            "Search a knowledge source. Set k to choose the maximum "
+            f"number of results; when omitted, k defaults to {k}. "
+            "Returns docid, score, and a character-truncated snippet. "
+            "Fewer results may be available."
+        )
 
     def get_document_description(self) -> str:
         """
