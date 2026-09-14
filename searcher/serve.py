@@ -330,7 +330,7 @@ async def main():
         names = {tool.name for tool in tools}
         expected = {"search"}
         if read_enabled == "1":
-            expected.add("read_document")
+            expected.update({"read_document", "search_in_document"})
         if not expected <= names:
             raise RuntimeError("Required tools are missing")
 

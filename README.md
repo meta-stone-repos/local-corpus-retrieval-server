@@ -15,7 +15,7 @@ The local retrieval server provides:
 - large-scale approximate retrieval through FAISS IVF-Flat;
 - independent, manifest-backed local corpora;
 - a SQLite document store for bounded full-document reading;
-- uniform `search` / `read_document` tools for offline and online retrieval;
+- uniform `search` / `read_document` / `search_in_document` tools for offline and online retrieval;
 - Zhipu and IQS adapters with stable URL IDs, lazy reading, and bounded transient caches;
 - unified YAML service selection, readiness reporting, logs, and group stop/status;
 - resumable corpus normalization and index construction;
@@ -51,7 +51,7 @@ The local retrieval server provides:
 | Online retrieval | Zhipu / Alibaba Cloud IQS | Live search and same-vendor webpage reading |
 | Online cache | Process-local mapping and body LRU/idle TTL | Cross-connection reads without repeated fetching |
 | Service launcher | `searcher/serve.py` + YAML | Select services, check readiness, inspect/stop a group |
-| MCP interface | FastMCP | Uniform `search` and `read_document` tools |
+| MCP interface | FastMCP | Uniform `search`, `read_document`, and `search_in_document` tools |
 
 Each local corpus is independent. Its normalized documents, document store, sparse index, dense index, and manifest are never merged with another corpus.
 
@@ -104,7 +104,7 @@ Wait for both `READY` messages. BM25 uses `http://127.0.0.1:8080/mcp`; Dense use
 
 To use online search without building local indexes, configure Zhipu/IQS credentials and start `--services online`, `--services iqs`, or `--services online iqs`. Online services do not require a local corpus or a snippet tokenizer; snippets are sliced by Unicode characters. See [online settings](#online-apis-and-cache) and [acceptance tests](#acceptance-tests).
 
-Both offline and online services expose `search(query, k=5)` and `read_document(docid, chunk_index=0)` with the [same successful-result schema](#tool-output-contract). Offline services need `get_document: true` to enable reading. Each read returns at most 8192 Unicode characters.
+Both offline and online services expose `search(query, k=5)` , `read_document(docid, chunk_index=0)`, and `search_in_document(docid, query, k=3)` with the [same successful-result schema](#tool-output-contract). Offline services need `get_document: true` to enable reading and within-document search. Each read returns at most 8192 Unicode characters.
 
 ## Environment setup
 
@@ -379,6 +379,10 @@ defaults:
     transport: sse
     k: 5
     snippet_max_chars: 2048
+    document_search_max_chars: 1000
+    document_search_overlap_chars: 200
+    document_search_default_k: 3
+    document_search_max_k: 10
 
 services:
   bm25:
@@ -538,7 +542,7 @@ The child inherits the launcher's environment. HF offline mode affects model/tok
 | `transport` | `sse` by default; grouped serving also supports `streamable-http`, not `stdio` |
 | `k` | Default `5`; fallback when an Agent omits Tool argument `k`, not a fixed per-service result cap |
 | `snippet_max_chars` | Default `2048` Unicode characters per result; `-1` disables truncation; positive integers otherwise |
-| `get_document` | Offline only; set `true` to register `read_document`; online always registers it |
+| `get_document` | Offline only; set `true` to register `read_document` and `search_in_document`; online always registers both |
 | `host` | Online only; worker default `0.0.0.0`, example uses `127.0.0.1` |
 
 `--check` does not instantiate Providers, validate every backend CLI option, load indexes/models, check port availability, or contact upstream APIs. Unknown worker arguments and deeper configuration errors can therefore still fail at startup. Do not set `args.config`, `args.searcher_type`, or `args.hf_token`: use `provider`, `backend`, and the `HF_TOKEN` environment variable respectively.
@@ -634,6 +638,66 @@ The following is a complete, internally consistent final-chunk example:
 - Unknown/expired online IDs and invalid/out-of-range chunk indices fail. The offline base reader can return `null` for a missing document; error payloads are not yet identical across all backends. Clients should handle both tool errors and missing results.
 
 Migration from older clients: use `read_document`, not a `get_document` tool; `get_document: true` remains only the offline registration flag. Move length/chunk logic from search results to read results, allow `score: null`, and do not depend on the removed public URL/title/source/language fields. Internal metadata/document-store columns have not been removed.
+
+
+### `search_in_document(docid: str, query: str, k: int = 3)`
+
+Find relevant passages **within one already identified document**. This is lexical retrieval, not another web search or a semantic question-answering model. It is registered alongside `read_document`: offline requires `get_document: true`; online always registers both. Restart an existing server after installing the feature. Read-enabled startup readiness checks expect all three tools.
+
+| Input | Meaning |
+| --- | --- |
+| `docid` | Required document ID previously returned by `search` |
+| `query` | Required non-empty keywords or phrase; words need not form an exact contiguous phrase |
+| `k` | Number of passages to return, default 3; strict integer from 1 through configured maximum (default 10) |
+
+Example request:
+
+```json
+{"docid": "example_doc", "query": "quantum evidence", "k": 3}
+```
+
+Illustrative response for a short document:
+
+```json
+{
+  "docid": "example_doc",
+  "query": "quantum evidence",
+  "results": [
+    {
+      "rank": 1,
+      "char_start": 0,
+      "char_end": 16,
+      "chunk_index": 0,
+      "end_chunk_index": 0,
+      "text": "quantum evidence"
+    }
+  ]
+}
+```
+
+- `rank` starts at 1; passages are ordered by relevance, not document position. No score is exposed.
+- Character offsets are zero-based Unicode character offsets into the full body: `text == body[char_start:char_end]`. They describe the whole passage, not exact keyword spans.
+- `chunk_index` and `end_chunk_index` identify the first and last 8192-character read chunks touched by the passage; both start at 0. Use `read_document` on these chunks for surrounding context.
+- Fewer than `k` passages is valid. No lexical match or an empty body returns `results: []`. Invalid parameters, unknown/expired document IDs, and upstream reading failures are errors, not empty successful matches.
+
+The implementation splits the original body into windows (default 1000 characters, 200-character overlap) and ranks matching windows with BM25. English/non-Han word tokens are case-folded; Chinese Han runs contribute single characters and adjacent character pairs. It uses Python's standard library, without a Hugging Face tokenizer, embedding model, synonym expansion, or stop-word removal. Common words and repeated headings can therefore rank highly; prefer distinctive terms and reformulate a query if needed.
+
+Selected windows with at least 50% overlap relative to the shorter window are suppressed. Windows are not merged, and the normal 200-character overlap can remain. This bounds output to at most `k` passages, each at most `max_chars` characters; it does not enumerate every occurrence or provide pagination.
+
+#### Document-search configuration
+
+Set these under `defaults.args`, or override under a service's `args`; restart to apply:
+
+| YAML key | Default | Meaning |
+| --- | --- | --- |
+| `document_search_max_chars` | 1000 | Maximum characters in each candidate/returned passage; positive integer |
+| `document_search_overlap_chars` | 200 | Overlap between adjacent candidate windows; integer from 0 to less than max chars |
+| `document_search_default_k` | 3 | Agent-visible default passage count |
+| `document_search_max_k` | 10 | Upper bound on per-call passage count; must be at least the default |
+
+These are separate from corpus/web `search`'s `k` (default 5), `snippet_max_chars` (default 2048), and the fixed 8192-character read chunk size. The corresponding entry-point CLI flags replace underscores with hyphens, for example `--document-search-max-chars`.
+
+Shared ranking lives in `searcher/document_search.py`. Offline reads the document store; online uses the same lazy body fetch, idle-TTL/LRU cache, and in-flight fetch deduplication as `read_document`. A document search refreshes body-cache access time. Expired/evicted bodies are fetched again while the ID mapping remains valid; a changed page can change offsets. Windows and ranking statistics are rebuilt per call, not retained as a separate persistent index. Adding a Provider still only requires its existing `search(query, k)` and `read(url)` adapter methods.
 
 ## Online APIs and cache
 
@@ -757,7 +821,7 @@ Adapter mock coverage should check exact URL/method/auth/body fields, nested res
 ### 1. Static and startup checks
 
 ```bash
-python3 -m py_compile searcher/serve.py searcher/tools.py searcher/searchers/base.py \
+python3 -m py_compile searcher/document_search.py searcher/serve.py searcher/tools.py searcher/searchers/base.py \
   searcher/online_mcp_server.py searcher/online_service.py \
   searcher/providers/base.py searcher/providers/registry.py \
   searcher/providers/zhipu.py searcher/providers/iqs.py
@@ -788,22 +852,32 @@ K = int(os.environ.get("REQUESTED_K", "7"))
 SNIPPET_MAX_CHARS = int(os.environ.get("SNIPPET_MAX_CHARS", "2048"))
 
 
-def decode(result):
+def decode(result, tool_name):
     if getattr(result, "is_error", False) or getattr(result, "isError", False):
         raise RuntimeError(str(result))
     blocks = result.content if hasattr(result, "content") else result
-    for block in blocks:
-        if getattr(block, "type", None) == "text":
-            try:
-                return json.loads(block.text)
-            except json.JSONDecodeError:
-                continue
-    raise RuntimeError(f"No JSON text in result: {result}")
-
+    values = [
+        json.loads(block.text)
+        for block in blocks
+        if getattr(block, "type", None) == "text"
+    ]
+    if tool_name == "search":
+        rows = []
+        for value in values:
+            if isinstance(value, list):
+                rows.extend(value)
+            elif isinstance(value, dict):
+                rows.append(value)
+            else:
+                raise RuntimeError(f"Unexpected search value: {value}")
+        return rows
+    if len(values) != 1 or not isinstance(values[0], dict):
+        raise RuntimeError(f"Expected one JSON object: {values}")
+    return values[0]
 
 async def call(name, arguments):
     async with Client(SSETransport(URL)) as client:
-        return decode(await client.call_tool(name, arguments))
+        return decode(await client.call_tool(name, arguments), name)
 
 
 def check_chunk(result, docid, index):
@@ -1021,7 +1095,72 @@ python3 -m py_compile /tmp/test_retrieval_online_cache.py
 python3 -m unittest discover -s /tmp -p test_retrieval_online_cache.py -v
 ```
 
+
+### 4. Within-document search smoke test
+
+Run inside Docker with services already started. Change `MCP_PORT` to 8082 (Dense), 8081 (Zhipu), or 8083 (IQS), according to your configuration. This prints the registered schema and verifies passages against read chunks; it does not evaluate ranking quality. A target-page fetch error is a failed prerequisite, not proof of a ranking failure. Keep the body TTL long enough to avoid a refetch during offset comparisons.
+
+```bash
+cd /workspace/BrowseComp-Plus
+MCP_PORT=8080 python3 - <<'PY'
+import asyncio
+import json
+import os
+import re
+from fastmcp import Client
+from fastmcp.client.transports import SSETransport
+
+async def main():
+    url = f"http://127.0.0.1:{os.environ.get('MCP_PORT', '8080')}/mcp"
+    async with Client(SSETransport(url)) as client:
+        async def call(name, args):
+            reply = await client.call_tool(name, args)
+            if getattr(reply, "is_error", False) or getattr(reply, "isError", False):
+                raise RuntimeError(str(reply))
+            blocks = reply.content if hasattr(reply, "content") else reply
+            values = [json.loads(b.text) for b in blocks if getattr(b, "type", None) == "text"]
+            if name == "search":
+                return [row for value in values for row in (value if isinstance(value, list) else [value])]
+            assert len(values) == 1 and isinstance(values[0], dict), values
+            return values[0]
+
+        tools = {tool.name: tool for tool in await client.list_tools()}
+        assert "search_in_document" in tools
+        print(json.dumps(tools["search_in_document"].inputSchema, ensure_ascii=False, indent=2))
+        hits = await call("search", {"query": "history", "k": 1})
+        assert hits, "Search returned no documents"
+        docid = hits[0]["docid"]
+        first = await call("read_document", {"docid": docid, "chunk_index": 0})
+        words = re.findall(r"[^\W_]+", first["text"], re.UNICODE)
+        assert words, "Choose another document with searchable text"
+        query = " ".join(words[:3])
+        found = await call("search_in_document", {"docid": docid, "query": query, "k": 2})
+        assert found["docid"] == docid and found["query"] == query
+        assert 1 <= len(found["results"]) <= 2, found
+        for rank, row in enumerate(found["results"], 1):
+            assert row["rank"] == rank
+            start, end = row["char_start"], row["char_end"]
+            assert 0 <= start < end and len(row["text"]) == end - start
+            assert row["chunk_index"] == start // 8192
+            assert row["end_chunk_index"] == (end - 1) // 8192
+            chunks = [
+                await call("read_document", {"docid": docid, "chunk_index": index})
+                for index in range(row["chunk_index"], row["end_chunk_index"] + 1)
+            ]
+            body = "".join(chunk["text"] for chunk in chunks)
+            offset = start - row["chunk_index"] * 8192
+            assert body[offset:offset + end - start] == row["text"]
+        print(json.dumps(found, ensure_ascii=False, indent=2))
+        print("PASS: registration, passage count, character offsets and read consistency")
+
+asyncio.run(main())
+PY
+```
+
 ### Acceptance record and boundaries
+
+For the new within-document tool, the user reported successful registration and search → read → passage checks on BM25, Dense, and Zhipu. IQS exposed the tool schema, but that run stopped at body reading: IQS returned outer HTTP 200 with target `statusCode: 405` and no body. The IQS-to-target fetch chain failed; these observations alone cannot distinguish a target-site restriction from an IQS request/redirect issue. This is not an IQS within-document end-to-end pass, and does not invalidate the earlier IQS search/read acceptance on other pages.
+
 
 The development deployment has reported successful online field checks, Zhipu cross-connection/chunk/TTL/concurrency/error checks, mock LRU/mapping/failure tests, and real IQS search followed by read. These are historical development results, not a guarantee for a fresh installation or every vendor engine. For the per-call-k/character-snippet change, the user additionally reported all four services exposing integer k with default 5 and a positive constraint, returning exactly 2 and 7 hits for k=2 and k=7, with every snippet at most 2048 characters. This verifies the core search changes; it does not prove that mixed-k Dense requests entered the same GPU batch or cover all boundaries/performance. No live tests were rerun by the assistant for this documentation synchronization. Record the date, dependency versions, non-secret configuration, backend/provider, test results, and fetch counts for each deployment. Never include API keys.
 

@@ -9,6 +9,7 @@ from collections import OrderedDict
 from contextlib import suppress
 
 from online_provider import Provider, valid_url
+from document_search import DocumentSearch
 
 
 log = logging.getLogger(__name__)
@@ -26,6 +27,7 @@ class OnlineService:
         cleanup_interval: float = 60,
         snippet_max_chars: int = 2048,
         k: int = 5,
+        document_search: DocumentSearch | None = None,
     ):
         for name, value in (
             ("content_ttl", content_ttl),
@@ -47,6 +49,7 @@ class OnlineService:
             raise ValueError("k must be a positive integer")
         self.k = k
         self.provider = provider
+        self.document_search = document_search or DocumentSearch()
         self.content_ttl = content_ttl
         self.max_bytes = max_bytes
         self.mapping_ttl = mapping_ttl
@@ -218,12 +221,7 @@ class OnlineService:
         if not task.cancelled():
             task.exception()
 
-    async def read_document(
-        self, docid: str, chunk_index: int = 0
-    ) -> dict:
-        if type(chunk_index) is not int or chunk_index < 0:
-            raise ValueError("chunk_index must be a non-negative integer")
-
+    async def _get_document_entry(self, docid):
         self._purge()
         document = self.documents.get(docid)
         if document is None:
@@ -243,6 +241,28 @@ class OnlineService:
         else:
             log.info("Reader cache hit: %s", docid)
 
+        if self.contents.get(docid) is entry:
+            entry["last_access"] = time.monotonic()
+            self.contents.move_to_end(docid)
+        return entry
+
+    async def search_in_document(self, docid, query, k=None):
+        requested_k = self.document_search.validate_request(query, k)
+        entry = await self._get_document_entry(docid)
+        return await asyncio.to_thread(
+            self.document_search.search,
+            docid,
+            entry["text"],
+            query,
+            requested_k,
+        )
+
+    async def read_document(
+        self, docid: str, chunk_index: int = 0
+    ) -> dict:
+        if type(chunk_index) is not int or chunk_index < 0:
+            raise ValueError("chunk_index must be a non-negative integer")
+        entry = await self._get_document_entry(docid)
         total = entry["char_count"]
         count = max(1, (total + CHUNK_SIZE - 1) // CHUNK_SIZE)
         if chunk_index >= count:
@@ -254,10 +274,6 @@ class OnlineService:
         start = chunk_index * CHUNK_SIZE
         end = min(start + CHUNK_SIZE, total)
         has_more = chunk_index + 1 < count
-
-        if self.contents.get(docid) is entry:
-            entry["last_access"] = time.monotonic()
-            self.contents.move_to_end(docid)
 
         return {
             "docid": docid,

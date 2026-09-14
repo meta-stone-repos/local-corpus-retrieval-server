@@ -4,6 +4,7 @@ from typing import Annotated, Any, Dict, List, Optional
 
 from fastmcp import FastMCP
 from searchers.base import BaseSearcher
+from document_search import DocumentSearch
 from pydantic import Field
 
 
@@ -17,6 +18,10 @@ def register_tools(
     dense_max_batch_size: int = 16,
     dense_max_wait_ms: float = 5.0,
     dense_max_queue_size: int = 64,
+    document_search_max_chars: int = 1000,
+    document_search_overlap_chars: int = 200,
+    document_search_default_k: int = 3,
+    document_search_max_k: int = 10,
 ):
     if type(k) is not int or k <= 0:
         raise ValueError("Default k must be a positive integer")
@@ -25,6 +30,13 @@ def register_tools(
         or (snippet_max_chars != -1 and snippet_max_chars <= 0)
     ):
         raise ValueError("snippet_max_chars must be positive or -1")
+
+    document_search = DocumentSearch(
+        max_chars=document_search_max_chars,
+        overlap_chars=document_search_overlap_chars,
+        default_k=document_search_default_k,
+        max_k=document_search_max_k,
+    )
 
     # BM25 uses multiple CPU workers.
     # Dense keeps exactly one backend worker; concurrency is achieved
@@ -369,3 +381,42 @@ def register_tools(
                 docid,
                 chunk_index,
             )
+
+        def _search_in_document_sync(docid, query, requested_k):
+            requested_k = document_search.validate_request(query, requested_k)
+            document = searcher.get_document(docid)
+            if document is None or not isinstance(document.get("text"), str):
+                raise ValueError("Unknown document or missing document text")
+            return document_search.search(
+                docid, document["text"], query, requested_k
+            )
+
+        async def search_in_document(
+            docid: str,
+            query: str,
+            k: int = document_search_default_k,
+        ) -> dict:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                document_executor,
+                _search_in_document_sync,
+                docid,
+                query,
+                k,
+            )
+
+        search_in_document.__annotations__["k"] = Annotated[
+            int, Field(gt=0, le=document_search_max_k, strict=True)
+        ]
+        mcp.tool(
+            name="search_in_document",
+            description=(
+                "Search relevant passages inside one known document. "
+                "Use keywords, phrase combinations, or a question. "
+                "Matching is lexical BM25, not semantic search. "
+                f"Return up to k passages; default {document_search_default_k}, "
+                f"maximum {document_search_max_k}. "
+                "Use chunk_index/end_chunk_index with read_document "
+                "when more context is needed."
+            ),
+        )(search_in_document)

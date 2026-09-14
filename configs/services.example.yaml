@@ -1,7 +1,3 @@
-# Copy to services.local.yaml and configure credentials locally.
-# Adjust index paths, HF cache location, and GPU IDs for your deployment.
-# runtime.env is intentionally omitted to avoid copying credentials.
-
 version: 1
 defaults:
   runtime:
@@ -11,6 +7,10 @@ defaults:
     transport: sse
     k: 5
     snippet_max_chars: 2048
+    document_search_max_chars: 1000
+    document_search_overlap_chars: 200
+    document_search_default_k: 3
+    document_search_max_k: 10
 services:
   bm25:
     backend: bm25

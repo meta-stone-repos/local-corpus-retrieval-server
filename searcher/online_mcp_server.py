@@ -14,6 +14,7 @@ from fastmcp import FastMCP
 from mcp_sse_compat import install_legacy_sse_cleanup_patch
 from online_provider import create_provider
 from online_service import OnlineService
+from document_search import DocumentSearch
 
 
 def positive_float(value):
@@ -44,6 +45,12 @@ async def serve(args, config):
         cleanup_interval=args.cache_cleanup_interval_seconds,
         snippet_max_chars=args.snippet_max_chars,
         k=args.k,
+        document_search=DocumentSearch(
+            max_chars=args.document_search_max_chars,
+            overlap_chars=args.document_search_overlap_chars,
+            default_k=args.document_search_default_k,
+            max_k=args.document_search_max_k,
+        ),
     )
 
     try:
@@ -87,6 +94,32 @@ async def serve(args, config):
             docid: str, chunk_index: int = 0
         ) -> dict:
             return await service.read_document(docid, chunk_index)
+
+
+        async def search_in_document(
+            docid: str,
+            query: str,
+            k: int = args.document_search_default_k,
+        ) -> dict:
+            return await service.search_in_document(docid, query, k)
+
+        search_in_document.__annotations__["k"] = Annotated[
+            int,
+            Field(gt=0, le=args.document_search_max_k, strict=True),
+        ]
+        mcp.tool(
+            name="search_in_document",
+            description=(
+                "Search relevant passages inside one known web document. "
+                "Use keywords, phrase combinations, or a question. "
+                "Matching is lexical BM25, not semantic search. "
+                f"Return up to k passages; default {args.document_search_default_k}, "
+                f"maximum {args.document_search_max_k}. "
+                "Fetch the document lazily when needed and reuse the read cache. "
+                "Use chunk_index/end_chunk_index with read_document "
+                "when more context is needed."
+            ),
+        )(search_in_document)
 
         if args.transport == "sse":
             install_legacy_sse_cleanup_patch()
@@ -150,6 +183,11 @@ def main():
         default=2048,
         help="Maximum Unicode characters per snippet; -1 disables truncation.",
     )
+    parser.add_argument("--document-search-max-chars", type=int, default=1000)
+    parser.add_argument("--document-search-overlap-chars", type=int, default=200)
+    parser.add_argument("--document-search-default-k", type=int, default=3)
+    parser.add_argument("--document-search-max-k", type=int, default=10)
+
     args = parser.parse_args()
 
     if args.snippet_max_chars != -1 and args.snippet_max_chars <= 0:

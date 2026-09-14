@@ -15,7 +15,7 @@ BrowseComp-Plus 上游资源：[数据集](https://huggingface.co/datasets/Tevat
 - 面向大规模语料的 FAISS IVF-Flat 近似检索；
 - 相互独立、由 manifest 管理的本地 corpus；
 - 用于受控全文读取的 SQLite 文档库；
-- 为离线和在线提供一致 `search` / `read_document` 字段的 MCP 服务；
+- 为离线和在线提供一致 `search` / `read_document` / `search_in_document` 字段的 MCP 服务；
 - 智谱和 IQS 适配器，支持稳定 URL ID、按需阅读及有上限的临时缓存；
 - 统一 YAML 服务选择、就绪提示、日志和整组查看/停止；
 - 可恢复的语料标准化与索引构建流程；
@@ -51,7 +51,7 @@ BrowseComp-Plus 上游资源：[数据集](https://huggingface.co/datasets/Tevat
 | 在线检索 | 智谱 / 阿里云 IQS | 实时搜索与同服务商网页阅读 |
 | 在线缓存 | 进程内映射及正文 LRU/空闲 TTL | 跨连接读取，避免反复抓取 |
 | 服务启动器 | `searcher/serve.py` + YAML | 选择服务、检查就绪、查看/停止整组 |
-| MCP 接口 | FastMCP | 提供统一的 `search` 和 `read_document` 工具 |
+| MCP 接口 | FastMCP | 提供统一的 `search`、`read_document` 和 `search_in_document` 工具 |
 
 每个本地 corpus 都是相互独立的。它的标准化文档、文档库、稀疏索引、稠密索引和 manifest 不会与其他 corpus 合并。
 
@@ -104,7 +104,7 @@ python3 searcher/serve.py --config configs/services.local.yaml --services bm25 d
 
 如果只使用在线搜索，不必构建本地索引：准备智谱/IQS 凭据后选择 `--services online`、`--services iqs` 或 `--services online iqs`。在线服务不依赖本地 corpus，也不需要 snippet tokenizer；snippet 直接按 Unicode 字符截断。详见[在线设置](#在线-api-与缓存)和[测试与验收](#测试与验收)。
 
-离线与在线都提供 `search(query, k=5)` 和 `read_document(docid, chunk_index=0)`，采用[相同的成功结果字段](#工具输出字段)。离线需设置 `get_document: true` 才会注册读取工具；每次读取最多返回 8192 个 Unicode 字符。
+离线与在线都提供 `search(query, k=5)` 、`read_document(docid, chunk_index=0)` 和 `search_in_document(docid, query, k=3)`，采用[相同的成功结果字段](#工具输出字段)。离线需设置 `get_document: true` 才会注册阅读和文内检索工具；每次读取最多返回 8192 个 Unicode 字符。
 
 ## 环境安装
 
@@ -379,6 +379,10 @@ defaults:
     transport: sse
     k: 5
     snippet_max_chars: 2048
+    document_search_max_chars: 1000
+    document_search_overlap_chars: 200
+    document_search_default_k: 3
+    document_search_max_k: 10
 
 services:
   bm25:
@@ -538,7 +542,7 @@ python3 searcher/serve.py --config configs/services.local.yaml --stop
 | `transport` | 默认 `sse`；整组启动也支持 `streamable-http`，不支持 `stdio` |
 | `k` | 默认 `5`；Agent 省略 Tool 参数 k 时的默认值，不是服务固定返回上限 |
 | `snippet_max_chars` | 每条结果默认最多 `2048` 个 Unicode 字符；`-1` 关闭截断，其他值须为正整数 |
-| `get_document` | 仅离线使用；`true` 注册 `read_document`；在线始终注册 |
+| `get_document` | 仅离线使用；`true` 注册 `read_document` 和 `search_in_document`；在线始终注册二者 |
 | `host` | 仅在线使用；在线入口默认 `0.0.0.0`，示例设置为 `127.0.0.1` |
 
 `--check` 不会创建 Provider、检查每个后端的全部 CLI 参数、加载索引/模型、检查端口占用或请求上游 API。因此未知子进程参数以及更深层配置错误仍可能在启动时才发现。不要设置 `args.config`、`args.searcher_type`、`args.hf_token`，分别使用 `provider`、`backend` 和 `HF_TOKEN` 环境变量。
@@ -634,6 +638,66 @@ Agent 能看到大于 0 的整数参数 `k`；schema 默认值在启动时取自
 - 未知/过期在线 docid、非法/越界 chunk 会报错。离线基础读取器在文档不存在时可能返回 `null`；不同后端的错误返回尚未完全统一，客户端应同时处理工具错误和缺失结果。
 
 旧客户端迁移：调用工具 `read_document`，而不是 `get_document`；`get_document: true` 只是离线注册工具的旧参数名。把长度和分块信息的读取从 search 移到 read，允许 `score: null`，不要再依赖已删除的公共 URL/title/source/language 字段。内部 metadata 和文档库列并没有因此删除。
+
+
+### `search_in_document(docid: str, query: str, k: int = 3)`
+
+在**已经确定的一篇文档内部**检索相关片段。它是词项匹配检索，不会再次搜索网页，也不是语义问答模型。与 `read_document` 一起注册：离线需要 `get_document: true`，在线始终注册二者。安装功能后需重启已有服务；启用阅读时，启动就绪检查会要求三个工具全部存在。
+
+| 输入 | 含义 |
+| --- | --- |
+| `docid` | 必填，先前由 `search` 返回的文档 ID |
+| `query` | 必填，非空关键词或短语组合，不要求在原文中连续、完整出现 |
+| `k` | 最多返回的片段数，默认 3；严格整数，范围为 1 到配置上限（默认 10） |
+
+调用示例：
+
+```json
+{"docid": "example_doc", "query": "quantum evidence", "k": 3}
+```
+
+假设文档正文很短，返回示例为：
+
+```json
+{
+  "docid": "example_doc",
+  "query": "quantum evidence",
+  "results": [
+    {
+      "rank": 1,
+      "char_start": 0,
+      "char_end": 16,
+      "chunk_index": 0,
+      "end_chunk_index": 0,
+      "text": "quantum evidence"
+    }
+  ]
+}
+```
+
+- `rank` 从 1 开始，按相关性排序，不按原文位置排序；不暴露 score。
+- 字符位置是相对于全文、从 0 开始的 Unicode 字符偏移，采用左闭右开区间：`text == body[char_start:char_end]`。它表示整个返回片段的位置，不是关键词的精确匹配位置。
+- `chunk_index`、`end_chunk_index` 是片段覆盖的第一个和最后一个 8192 字符阅读块编号，均从 0 开始。需要更多上下文时，用这些编号调用 `read_document`。
+- 结果可以少于 `k` 条。没有词项匹配或正文为空时返回 `results: []`；参数非法、docid 不存在/映射过期、上游读取失败属于错误，不伪装成成功的空匹配。
+
+实现会把原文切成窗口（默认每窗 1000 字符、相邻重叠 200 字符），通过 BM25 对有匹配的窗口排序。英文等非汉字部分按词切分并忽略大小写；汉字连续串使用单字和相邻双字。仅使用 Python 标准库，不依赖 Hugging Face tokenizer、向量模型、同义词扩展，也不移除停用词。因此常见词和重复标题可能排得较高，Agent 应优先使用有辨识度的词，必要时改写查询。
+
+选择结果时，若窗口与已选窗口的重叠长度达到较短窗口长度的 50%，会抑制该窗口。不会合并片段，正常的 200 字符重叠仍可能存在。返回量最多 `k` 条、每条最多 `max_chars` 字符，不枚举全部匹配位置，也不提供翻页参数。
+
+#### 文内检索配置
+
+以下字段放在 `defaults.args`，也可在各服务 `args` 内覆盖；修改后重启生效：
+
+| YAML 字段 | 默认值 | 含义 |
+| --- | --- | --- |
+| `document_search_max_chars` | 1000 | 候选窗口及返回片段的字符上限，正整数 |
+| `document_search_overlap_chars` | 200 | 相邻窗口重叠字符数，整数，须大于等于 0 且小于 max chars |
+| `document_search_default_k` | 3 | 暴露给 Agent 的默认片段数 |
+| `document_search_max_k` | 10 | 单次请求片段数上限，不能小于默认值 |
+
+它们与全库/网页 `search` 的 `k`（默认 5）、`snippet_max_chars`（默认 2048），以及固定 8192 字符的阅读块大小相互独立。底层入口的 CLI 参数将下划线改为连字符，例如 `--document-search-max-chars`。
+
+公共排序逻辑位于 `searcher/document_search.py`。离线从文档库取正文；在线与 `read_document` 共用正文懒加载、空闲 TTL/LRU 缓存和并发抓取去重。文内检索会刷新正文缓存的访问时间。正文过期或被淘汰后，只要 docid 映射有效就能重新抓取；页面变化时偏移也可能变化。窗口和排序统计每次调用重新计算，不另建持久化索引。新增 Provider 仍只需适配已有的 `search(query, k)` 与 `read(url)`，无需增加文内检索接口。
 
 ## 在线 API 与缓存
 
@@ -757,7 +821,7 @@ HTTP/网络/API 失败、响应格式损坏、目标网页受限或正文缺失�
 ### 1. 静态和启动检查
 
 ```bash
-python3 -m py_compile searcher/serve.py searcher/tools.py searcher/searchers/base.py \
+python3 -m py_compile searcher/document_search.py searcher/serve.py searcher/tools.py searcher/searchers/base.py \
   searcher/online_mcp_server.py searcher/online_service.py \
   searcher/providers/base.py searcher/providers/registry.py \
   searcher/providers/zhipu.py searcher/providers/iqs.py
@@ -788,22 +852,32 @@ K = int(os.environ.get("REQUESTED_K", "7"))
 SNIPPET_MAX_CHARS = int(os.environ.get("SNIPPET_MAX_CHARS", "2048"))
 
 
-def decode(result):
+def decode(result, tool_name):
     if getattr(result, "is_error", False) or getattr(result, "isError", False):
         raise RuntimeError(str(result))
     blocks = result.content if hasattr(result, "content") else result
-    for block in blocks:
-        if getattr(block, "type", None) == "text":
-            try:
-                return json.loads(block.text)
-            except json.JSONDecodeError:
-                continue
-    raise RuntimeError(f"No JSON text in result: {result}")
-
+    values = [
+        json.loads(block.text)
+        for block in blocks
+        if getattr(block, "type", None) == "text"
+    ]
+    if tool_name == "search":
+        rows = []
+        for value in values:
+            if isinstance(value, list):
+                rows.extend(value)
+            elif isinstance(value, dict):
+                rows.append(value)
+            else:
+                raise RuntimeError(f"Unexpected search value: {value}")
+        return rows
+    if len(values) != 1 or not isinstance(values[0], dict):
+        raise RuntimeError(f"Expected one JSON object: {values}")
+    return values[0]
 
 async def call(name, arguments):
     async with Client(SSETransport(URL)) as client:
-        return decode(await client.call_tool(name, arguments))
+        return decode(await client.call_tool(name, arguments), name)
 
 
 def check_chunk(result, docid, index):
@@ -1021,7 +1095,72 @@ python3 -m py_compile /tmp/test_retrieval_online_cache.py
 python3 -m unittest discover -s /tmp -p test_retrieval_online_cache.py -v
 ```
 
+### 4. 文内检索冒烟测试
+
+在 Docker 内、服务已启动时执行。按实际配置将 `MCP_PORT` 改为 8082（Dense）、8081（智谱）或 8083（IQS）。该脚本打印注册的 schema，并用阅读块核对返回片段，不评估排序质量。目标网页抓取失败属于前置读取失败，不能据此认定排序逻辑有问题。核对期间应保持正文 TTL 足够长，避免重新抓取不同版本。
+
+```bash
+cd /workspace/BrowseComp-Plus
+MCP_PORT=8080 python3 - <<'PY'
+import asyncio
+import json
+import os
+import re
+from fastmcp import Client
+from fastmcp.client.transports import SSETransport
+
+async def main():
+    url = f"http://127.0.0.1:{os.environ.get('MCP_PORT', '8080')}/mcp"
+    async with Client(SSETransport(url)) as client:
+        async def call(name, args):
+            reply = await client.call_tool(name, args)
+            if getattr(reply, "is_error", False) or getattr(reply, "isError", False):
+                raise RuntimeError(str(reply))
+            blocks = reply.content if hasattr(reply, "content") else reply
+            values = [json.loads(b.text) for b in blocks if getattr(b, "type", None) == "text"]
+            if name == "search":
+                return [row for value in values for row in (value if isinstance(value, list) else [value])]
+            assert len(values) == 1 and isinstance(values[0], dict), values
+            return values[0]
+
+        tools = {tool.name: tool for tool in await client.list_tools()}
+        assert "search_in_document" in tools
+        print(json.dumps(tools["search_in_document"].inputSchema, ensure_ascii=False, indent=2))
+        hits = await call("search", {"query": "history", "k": 1})
+        assert hits, "Search returned no documents"
+        docid = hits[0]["docid"]
+        first = await call("read_document", {"docid": docid, "chunk_index": 0})
+        words = re.findall(r"[^\W_]+", first["text"], re.UNICODE)
+        assert words, "Choose another document with searchable text"
+        query = " ".join(words[:3])
+        found = await call("search_in_document", {"docid": docid, "query": query, "k": 2})
+        assert found["docid"] == docid and found["query"] == query
+        assert 1 <= len(found["results"]) <= 2, found
+        for rank, row in enumerate(found["results"], 1):
+            assert row["rank"] == rank
+            start, end = row["char_start"], row["char_end"]
+            assert 0 <= start < end and len(row["text"]) == end - start
+            assert row["chunk_index"] == start // 8192
+            assert row["end_chunk_index"] == (end - 1) // 8192
+            chunks = [
+                await call("read_document", {"docid": docid, "chunk_index": index})
+                for index in range(row["chunk_index"], row["end_chunk_index"] + 1)
+            ]
+            body = "".join(chunk["text"] for chunk in chunks)
+            offset = start - row["chunk_index"] * 8192
+            assert body[offset:offset + end - start] == row["text"]
+        print(json.dumps(found, ensure_ascii=False, indent=2))
+        print("PASS: registration, passage count, character offsets and read consistency")
+
+asyncio.run(main())
+PY
+```
+
+
 ### 验收记录与边界
+
+新增文内检索工具后，用户反馈 BM25、Dense、智谱已通过工具注册以及 search → read → 文内片段核对。IQS 可以列出该工具的 schema，但当次测试在正文读取阶段中止：IQS 外层 HTTP 为 200，目标页 `statusCode: 405`，没有正文。可以定位到 IQS 到目标网页的抓取链路失败，仅凭该结果无法区分目标站限制还是 IQS 的请求/跳转处理问题。因此这次不能记为 IQS 文内检索端到端通过，也不否定此前其他页面的 IQS search/read 验收结果。
+
 
 开发部署已经反馈通过在线字段检查，智谱跨连接/分块/TTL/并发/错误检查，LRU/映射/失败的 mock 测试，以及 IQS 真实搜索后阅读。这些属于历史开发验收，不代表新安装或所有服务商引擎都自动通过；本次 k/字符截断改动，用户另已确认四个服务均暴露默认值为 5、要求大于 0 的整数 k，请求 k=2、k=7 分别返回 2 条、7 条，且所有 snippet 不超过 2048 字符。这确认了搜索核心改动，但不能据此证明不同 k 的 Dense 请求恰好进入同一 GPU batch，也不代表全部边界和性能已覆盖。本次文档同步由助手直接更新，未重新执行实机测试。每次部署应记录日期、依赖版本、脱敏配置、后端/服务商、测试结果和抓取次数，不要记录 API key。
 

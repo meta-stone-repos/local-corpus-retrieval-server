@@ -116,6 +116,11 @@ def main():
 
         searcher_class.parse_args(parser)
 
+        parser.add_argument("--document-search-max-chars", type=int, default=1000)
+        parser.add_argument("--document-search-overlap-chars", type=int, default=200)
+        parser.add_argument("--document-search-default-k", type=int, default=3)
+        parser.add_argument("--document-search-max-k", type=int, default=10)
+
         args = parser.parse_args()
         if args.k <= 0:
             parser.error("--k must be positive")
@@ -162,11 +167,15 @@ def main():
             dense_max_batch_size=args.dense_max_batch_size,
             dense_max_wait_ms=args.dense_max_wait_ms,
             dense_max_queue_size=args.dense_max_queue_size,
+            document_search_max_chars=args.document_search_max_chars,
+            document_search_overlap_chars=args.document_search_overlap_chars,
+            document_search_default_k=args.document_search_default_k,
+            document_search_max_k=args.document_search_max_k,
         )
 
         tools_registered = ["search"]
         if include_get_document:
-            tools_registered.append("read_document")
+            tools_registered.extend(["read_document", "search_in_document"])
         tools_str = ", ".join(tools_registered)
 
         print(
