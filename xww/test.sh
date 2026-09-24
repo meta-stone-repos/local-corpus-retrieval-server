@@ -16,11 +16,22 @@ from fastmcp.client.transports import SSETransport
 
 QUERY = "What is machine learning?"
 
+def format_tool(tool):
+    description = " ".join((getattr(tool, "description", "") or "").split())
+    if description:
+        return f"  - {tool.name}: {description}"
+    return f"  - {tool.name}"
+
 async def test_service(name, url):
     try:
         async with Client(SSETransport(url=url)) as client:
+            tools = await client.list_tools()
+            print(f"\n[{name}] {url}")
+            print("Tools:")
+            for tool in tools:
+                print(format_tool(tool))
             result = await client.call_tool("search", {"query": QUERY})
-        print(f"\n[{name}] {url}")
+        print("Result:")
         for item in result:
             print(getattr(item, "text", item))
         return True

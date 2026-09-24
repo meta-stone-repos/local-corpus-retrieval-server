@@ -1,0 +1,17 @@
+# Local BM25 + Dense launcher for the xww-enwikibooks corpus.
+# Index/model settings come from corpora/xww-enwikibooks/manifest.json.
+version: 1
+defaults:
+  args:
+    transport: sse
+    k: 10
+    snippet_max_chars: 1024
+    get_document: true
+services:
+  bm25:
+    backend: bm25
+    args:
+      port: 8090
+      bm25_workers: 16
+      index_path: indexes/corpora/browsecomp-plus/bm25
+  

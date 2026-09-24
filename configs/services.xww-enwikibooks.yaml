@@ -1,0 +1,25 @@
+# Local BM25 + Dense launcher for the xww-enwikibooks corpus.
+# Index/model settings come from corpora/xww-enwikibooks/manifest.json.
+version: 1
+defaults:
+  args:
+    transport: sse
+    k: 10
+    snippet_max_chars: 1024
+    corpus: xww-enwikibooks
+    get_document: true
+services:
+  bm25:
+    backend: bm25
+    args:
+      port: 8090
+      bm25_workers: 16
+  dense:
+    backend: faiss
+    runtime:
+      cuda_visible_devices: "7"
+    args:
+      port: 8091
+      dense_max_batch_size: 16
+      dense_max_wait_ms: 1
+      dense_max_queue_size: 64
